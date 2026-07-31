@@ -33,10 +33,22 @@ pub struct State {
 pub struct Profile {
     pub config_dir: PathBuf,
     pub created_at: u64,
+    /// The directory pre-existed claude-account and is only registered, not
+    /// managed; 0.1.1 state files deserialize as managed.
+    #[serde(default)]
+    pub adopted: bool,
 }
 
 impl Profile {
     pub fn new(config_dir: PathBuf) -> Self {
+        Self::create(config_dir, false)
+    }
+
+    pub fn new_adopted(config_dir: PathBuf) -> Self {
+        Self::create(config_dir, true)
+    }
+
+    fn create(config_dir: PathBuf, adopted: bool) -> Self {
         let created_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -44,6 +56,7 @@ impl Profile {
         Self {
             config_dir,
             created_at,
+            adopted,
         }
     }
 }
@@ -158,6 +171,15 @@ fn temporary_state_path(state_file: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profiles_from_0_1_1_state_files_load_as_managed() {
+        let profile: Profile = serde_json::from_str(
+            r#"{"config_dir":"/home/user/.local/share/claude-account/profiles/work","created_at":1}"#,
+        )
+        .unwrap();
+        assert!(!profile.adopted);
+    }
 
     #[test]
     fn state_round_trip_preserves_profiles() {

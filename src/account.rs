@@ -2,13 +2,11 @@ use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::paths::AppPaths;
@@ -19,7 +17,7 @@ use crate::state::{self, Profile, StateLock};
 #[command(
     name = "claude account",
     version,
-    about = "Manage isolated Claude Code accounts on Linux"
+    about = "Manage isolated Claude Code accounts"
 )]
 pub struct AccountCli {
     #[command(subcommand)]
@@ -42,10 +40,22 @@ enum AccountCommand {
         #[arg(long)]
         console: bool,
     },
+    /// Register an existing CLAUDE_CONFIG_DIR as a profile without copying or
+    /// modifying it
+    Adopt {
+        /// Profile name, such as work or personal
+        name: String,
+        /// The existing Claude configuration directory
+        directory: PathBuf,
+    },
     /// Select the profile used by future Claude processes
     Use { name: String },
     /// List registered profiles
-    List,
+    List {
+        /// Also query each profile's login state, email, and plan
+        #[arg(long)]
+        status: bool,
+    },
     /// Print only the active profile name
     Current,
     /// Log out and unregister a profile
@@ -60,6 +70,9 @@ enum AccountCommand {
         /// Allow removing the active profile
         #[arg(long)]
         force: bool,
+        /// Unregister without logging the profile out
+        #[arg(long, conflicts_with = "purge")]
+        keep_login: bool,
     },
     /// Install the transparent `claude` shim
     Install {
@@ -78,15 +91,17 @@ impl AccountCli {
                 sso,
                 console,
             } => add(paths, &name, email.as_deref(), sso, console),
+            AccountCommand::Adopt { name, directory } => adopt(paths, &name, &directory),
             AccountCommand::Use { name } => use_profile(paths, &name),
-            AccountCommand::List => list(paths),
+            AccountCommand::List { status } => list(paths, status),
             AccountCommand::Current => current(paths),
             AccountCommand::Remove {
                 name,
                 purge,
                 yes: _,
                 force,
-            } => remove(paths, &name, purge, force),
+                keep_login,
+            } => remove(paths, &name, purge, force, keep_login),
             AccountCommand::Install { real } => install(paths, real.as_deref()),
         }
     }
@@ -109,6 +124,21 @@ fn add(paths: &AppPaths, name: &str, email: Option<&str>, sso: bool, console: bo
         &current_executable,
         paths,
     )?;
+
+    match process::fresh_dir_sees_login(&real_claude, paths) {
+        Some(true) => bail!(
+            "cannot add a profile: a brand-new configuration directory already sees an existing \
+             login, so this Claude Code build shares credentials across profiles (older macOS \
+             builds keep a single keychain item for every CLAUDE_CONFIG_DIR). Update Claude Code \
+             with `claude update` and retry"
+        ),
+        Some(false) => {}
+        None => eprintln!(
+            "warning: could not verify that Claude Code isolates credentials per profile; \
+             continuing"
+        ),
+    }
+
     let profile_dir = paths.profile_dir(name);
     state::ensure_private_dir(&profile_dir)?;
 
@@ -131,19 +161,20 @@ fn add(paths: &AppPaths, name: &str, email: Option<&str>, sso: bool, console: bo
         );
     }
 
-    let verification = process::managed_command(&real_claude, &profile_dir)
-        .args(["auth", "status", "--json"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .output()
+    let auth_status = process::auth_status(&real_claude, &profile_dir, false)
         .context("failed to verify Claude login")?;
-    if !verification.status.success() {
-        bail!("Claude did not report a valid login for profile `{name}`");
-    }
-    let auth_status: AuthStatus = serde_json::from_slice(&verification.stdout)
-        .context("Claude returned an invalid response from `auth status --json`")?;
     if !auth_status.logged_in {
         bail!("Claude did not report a valid login for profile `{name}`");
+    }
+
+    if let Some(true) = process::fresh_dir_sees_login(&real_claude, paths) {
+        bail!(
+            "Claude Code stored this login in shared credential storage instead of isolating it \
+             per profile; it may have replaced another account's login. Undo it with \
+             `CLAUDE_CONFIG_DIR='{}' claude auth logout`, update Claude Code with \
+             `claude update`, and retry",
+            profile_dir.display()
+        );
     }
 
     complete_claude_onboarding(&profile_dir)?;
@@ -174,10 +205,132 @@ fn add(paths: &AppPaths, name: &str, email: Option<&str>, sso: bool, console: bo
     Ok(())
 }
 
-#[derive(Debug, Deserialize)]
-struct AuthStatus {
-    #[serde(rename = "loggedIn")]
-    logged_in: bool,
+fn adopt(paths: &AppPaths, name: &str, directory: &Path) -> Result<()> {
+    validate_profile_name(name)?;
+    let directory = normalize_adopted_directory(directory)?;
+    let metadata = fs::metadata(&directory)
+        .with_context(|| format!("cannot adopt {}", directory.display()))?;
+    if !metadata.is_dir() {
+        bail!("cannot adopt {}: not a directory", directory.display());
+    }
+
+    let current_executable = env::current_exe().context("failed to locate this executable")?;
+    let configured = {
+        let _lock = StateLock::acquire(paths)?;
+        let state = state::load(paths)?;
+        ensure_unregistered(&state, name, &directory)?;
+        state.real_claude
+    };
+    let real_claude =
+        process::resolve_real_claude(configured.as_deref(), &current_executable, paths)?;
+
+    match process::fresh_dir_sees_login(&real_claude, paths) {
+        Some(true) => bail!(
+            "cannot adopt a profile: a brand-new configuration directory already sees an existing \
+             login, so this Claude Code build shares credentials across profiles (older macOS \
+             builds keep a single keychain item for every CLAUDE_CONFIG_DIR) and switching \
+             between profiles cannot work. Update Claude Code with `claude update` and retry"
+        ),
+        Some(false) => {}
+        None => eprintln!(
+            "warning: could not verify that Claude Code isolates credentials per profile; \
+             continuing"
+        ),
+    }
+
+    match process::auth_status(&real_claude, &directory, true) {
+        Ok(status) if status.logged_in => {}
+        Ok(_) => eprintln!(
+            "note: {} has no active login; activate the profile and run `claude auth login` \
+             when ready",
+            directory.display()
+        ),
+        Err(error) => eprintln!(
+            "warning: could not check the login state of {}: {error:#}",
+            directory.display()
+        ),
+    }
+
+    let is_default = process::is_default_claude_config_dir(
+        &directory,
+        env::var_os("HOME").map(PathBuf::from).as_deref(),
+    );
+
+    let first_profile;
+    {
+        let _lock = StateLock::acquire(paths)?;
+        let mut state = state::load(paths)?;
+        ensure_unregistered(&state, name, &directory)?;
+        first_profile = state.profiles.is_empty();
+        state.real_claude = Some(real_claude);
+        state
+            .profiles
+            .insert(name.to_owned(), Profile::new_adopted(directory.clone()));
+        if first_profile {
+            state.active = Some(name.to_owned());
+        }
+        state::save(paths, &state)?;
+    }
+
+    println!("Adopted `{name}` from {}.", directory.display());
+    if is_default {
+        println!(
+            "This is Claude's default directory, so the profile runs Claude without \
+             CLAUDE_CONFIG_DIR and shares the login of a plain `claude` command."
+        );
+    }
+    if first_profile {
+        println!("`{name}` is now active.");
+    } else {
+        println!("Activate it with `claude account use {name}`.");
+    }
+    Ok(())
+}
+
+fn ensure_unregistered(state: &state::State, name: &str, directory: &Path) -> Result<()> {
+    if state.profiles.contains_key(name) {
+        bail!("profile `{name}` already exists");
+    }
+    for (existing, profile) in &state.profiles {
+        if profile.config_dir == directory {
+            bail!(
+                "{} is already registered as profile `{existing}`",
+                directory.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Make the path absolute and lexically drop `.`/`..` segments and trailing
+/// slashes without resolving symlinks: Claude Code derives its
+/// credential-storage key from the literal path string, so the stored spelling
+/// must stay stable, and two spellings of the same directory must normalize
+/// identically.
+fn normalize_adopted_directory(directory: &Path) -> Result<PathBuf> {
+    let absolute = if directory.is_absolute() {
+        directory.to_path_buf()
+    } else {
+        env::current_dir()
+            .context("failed to resolve the current directory")?
+            .join(directory)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    bail!(
+                        "cannot adopt {}: path escapes the filesystem root",
+                        directory.display()
+                    );
+                }
+            }
+            other => normalized.push(other),
+        }
+    }
+    Ok(normalized)
 }
 
 fn complete_claude_onboarding(profile_dir: &Path) -> Result<()> {
@@ -239,21 +392,45 @@ fn use_profile(paths: &AppPaths, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn list(paths: &AppPaths) -> Result<()> {
+fn list(paths: &AppPaths, with_status: bool) -> Result<()> {
     let state = state::load(paths)?;
     if state.profiles.is_empty() {
         println!("No profiles. Add one with `claude account add NAME`.");
         return Ok(());
     }
-    for name in state.profiles.keys() {
+    for (name, profile) in &state.profiles {
         let marker = if state.active.as_deref() == Some(name) {
             "*"
         } else {
             " "
         };
-        println!("{marker} {name}");
+        let mut line = format!("{marker} {name}");
+        if profile.adopted {
+            line.push_str(&format!("  ({})", profile.config_dir.display()));
+        }
+        if with_status {
+            line.push_str(&format!("  {}", profile_status(&state, profile)));
+        }
+        println!("{line}");
     }
     Ok(())
+}
+
+fn profile_status(state: &state::State, profile: &Profile) -> String {
+    let Some(real_claude) = state.real_claude.as_deref() else {
+        return "[status unavailable: run `claude-account install`]".to_owned();
+    };
+    match process::auth_status(real_claude, &profile.config_dir, true) {
+        Ok(status) if status.logged_in => {
+            let email = status.email.unwrap_or_else(|| "logged in".to_owned());
+            match status.subscription_type {
+                Some(plan) => format!("{email} ({plan})"),
+                None => email,
+            }
+        }
+        Ok(_) => "logged out".to_owned(),
+        Err(_) => "[status unavailable]".to_owned(),
+    }
 }
 
 fn current(paths: &AppPaths) -> Result<()> {
@@ -267,9 +444,9 @@ fn current(paths: &AppPaths) -> Result<()> {
     }
 }
 
-fn remove(paths: &AppPaths, name: &str, purge: bool, force: bool) -> Result<()> {
+fn remove(paths: &AppPaths, name: &str, purge: bool, force: bool, keep_login: bool) -> Result<()> {
     validate_profile_name(name)?;
-    let (profile, real_claude, is_active) = {
+    let (profile, real_claude, is_active, adopted) = {
         let _lock = StateLock::acquire(paths)?;
         let state = state::load(paths)?;
         let profile = state
@@ -277,26 +454,52 @@ fn remove(paths: &AppPaths, name: &str, purge: bool, force: bool) -> Result<()> 
             .get(name)
             .cloned()
             .with_context(|| format!("profile `{name}` does not exist"))?;
-        let real_claude = state
-            .real_claude
-            .clone()
-            .context("real Claude executable is not configured")?;
+        let adopted = profile.adopted;
+        if purge && adopted {
+            bail!(
+                "refusing to purge adopted directory {}; remove the profile without --purge and \
+                 delete the directory yourself if that is what you want",
+                profile.config_dir.display()
+            );
+        }
         let is_active = state.active.as_deref() == Some(name);
         if is_active && !force {
             bail!(
                 "`{name}` is active; switch profiles first, or pass --force to leave no active profile"
             );
         }
-        (profile, real_claude, is_active)
+        (profile, state.real_claude.clone(), is_active, adopted)
     };
 
-    println!("Logging out profile `{name}`...");
-    let logout_status = process::managed_command(&real_claude, &profile.config_dir)
-        .args(["auth", "logout"])
-        .status()
-        .context("failed to start Claude logout")?;
-    if !logout_status.success() {
-        bail!("Claude logout failed; profile `{name}` was not removed");
+    if keep_login || adopted {
+        if adopted && !keep_login {
+            let is_default = process::is_default_claude_config_dir(
+                &profile.config_dir,
+                env::var_os("HOME").map(PathBuf::from).as_deref(),
+            );
+            if is_default {
+                println!(
+                    "Leaving the adopted profile `{name}` logged in. To also log it out, run \
+                     `claude auth logout`."
+                );
+            } else {
+                println!(
+                    "Leaving the adopted profile `{name}` logged in. To also log it out, run \
+                     `CLAUDE_CONFIG_DIR='{}' claude auth logout`.",
+                    profile.config_dir.display()
+                );
+            }
+        }
+    } else {
+        let real_claude = real_claude.context("real Claude executable is not configured")?;
+        println!("Logging out profile `{name}`...");
+        let logout_status = process::managed_command(&real_claude, &profile.config_dir)
+            .args(["auth", "logout"])
+            .status()
+            .context("failed to start Claude logout")?;
+        if !logout_status.success() {
+            bail!("Claude logout failed; profile `{name}` was not removed");
+        }
     }
 
     {
@@ -326,6 +529,11 @@ fn remove(paths: &AppPaths, name: &str, purge: bool, force: bool) -> Result<()> 
         fs::remove_dir_all(&expected)
             .with_context(|| format!("failed to purge {}", expected.display()))?;
         println!("Removed `{name}` and permanently deleted its local data.");
+    } else if adopted {
+        println!(
+            "Removed `{name}`. The adopted directory {} was not touched.",
+            profile.config_dir.display()
+        );
     } else {
         println!(
             "Removed `{name}`. Its non-credential data remains at {}.",
@@ -414,9 +622,31 @@ fn install(paths: &AppPaths, explicit_real: Option<&Path>) -> Result<()> {
     println!("Real Claude: {}", real_claude.display());
     println!("Shim: {}", paths.shim.display());
     println!();
-    println!("Add this line to ~/.bashrc, then open a new terminal:");
-    println!("export PATH=\"{}:$PATH\"", paths.shim_dir.display());
+    print_path_instructions(&paths.shim_dir);
     Ok(())
+}
+
+fn print_path_instructions(shim_dir: &Path) {
+    let shell = env::var("SHELL").unwrap_or_default();
+    let shell_name = Path::new(&shell)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    match shell_name {
+        "fish" => {
+            println!("Run this once so the shim comes first on PATH:");
+            println!("fish_add_path --move --prepend {}", shim_dir.display());
+        }
+        shell_name => {
+            let startup_file = if shell_name == "zsh" {
+                "~/.zshrc"
+            } else {
+                "~/.bashrc"
+            };
+            println!("Add this line to {startup_file}, then open a new terminal:");
+            println!("export PATH=\"{}:$PATH\"", shim_dir.display());
+        }
+    }
 }
 
 fn validate_profile_name(name: &str) -> Result<()> {
@@ -440,6 +670,65 @@ fn validate_profile_name(name: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn install_fake_claude(path: &Path, script: &str) {
+        fs::write(path, script).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A fake Claude that stores credentials inside CLAUDE_CONFIG_DIR, the way
+    /// real per-profile isolation behaves. Like real builds, it exits nonzero
+    /// from `auth status --json` when logged out while still printing JSON.
+    fn namespaced_fake_claude(log: &Path) -> String {
+        format!(
+            "#!/bin/sh\n\
+             printf '%s|%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$*\" >> '{}'\n\
+             if [ \"$1 $2\" = \"auth login\" ]; then\n\
+               touch \"$CLAUDE_CONFIG_DIR/.fake-credentials\"\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1 $2 $3\" = \"auth status --json\" ]; then\n\
+               if [ -f \"$CLAUDE_CONFIG_DIR/.fake-credentials\" ]; then\n\
+                 printf '{{\"loggedIn\":true}}\\n'\n\
+                 exit 0\n\
+               fi\n\
+               printf '{{\"loggedIn\":false}}\\n'\n\
+               exit 1\n\
+             fi\n\
+             exit 0\n",
+            log.display()
+        )
+    }
+
+    /// A fake Claude that stores credentials in one shared location regardless
+    /// of CLAUDE_CONFIG_DIR, the way old macOS builds used a single keychain
+    /// item.
+    fn shared_storage_fake_claude(shared_credentials: &Path) -> String {
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1 $2\" = \"auth login\" ]; then\n\
+               touch '{shared}'\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1 $2 $3\" = \"auth status --json\" ]; then\n\
+               if [ -f '{shared}' ]; then\n\
+                 printf '{{\"loggedIn\":true}}\\n'\n\
+               else\n\
+                 printf '{{\"loggedIn\":false}}\\n'\n\
+               fi\n\
+               exit 0\n\
+             fi\n\
+             exit 0\n",
+            shared = shared_credentials.display()
+        )
+    }
+
+    fn configure_real_claude(paths: &AppPaths, fake_claude: &Path) {
+        let _lock = StateLock::acquire(paths).unwrap();
+        let mut initial = state::load(paths).unwrap();
+        initial.real_claude = Some(fake_claude.to_path_buf());
+        state::save(paths, &initial).unwrap();
+    }
+
     #[test]
     fn profile_name_validation_blocks_path_traversal() {
         for invalid in ["", "../work", ".work", "work space", "work/personal"] {
@@ -456,27 +745,8 @@ mod tests {
         let paths = AppPaths::from_roots(temp.path().join("config"), temp.path().join("data"));
         let fake_claude = temp.path().join("claude-real");
         let log = temp.path().join("calls.log");
-        let mut script = fs::File::create(&fake_claude).unwrap();
-        writeln!(
-            script,
-            "#!/bin/sh\n\
-             printf '%s|%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$*\" >> '{}'\n\
-             if [ \"$1 $2 $3\" = \"auth status --json\" ]; then\n\
-               printf '{{\"loggedIn\":true}}\\n'\n\
-             fi\n\
-             exit 0",
-            log.display()
-        )
-        .unwrap();
-        drop(script);
-        fs::set_permissions(&fake_claude, fs::Permissions::from_mode(0o755)).unwrap();
-
-        {
-            let _lock = StateLock::acquire(&paths).unwrap();
-            let mut initial = state::load(&paths).unwrap();
-            initial.real_claude = Some(fake_claude);
-            state::save(&paths, &initial).unwrap();
-        }
+        install_fake_claude(&fake_claude, &namespaced_fake_claude(&log));
+        configure_real_claude(&paths, &fake_claude);
 
         add(&paths, "work", None, false, false).unwrap();
         let calls = fs::read_to_string(log).unwrap();
@@ -519,27 +789,210 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let paths = AppPaths::from_roots(temp.path().join("config"), temp.path().join("data"));
         let fake_claude = temp.path().join("claude-real");
-        fs::write(
+        install_fake_claude(
             &fake_claude,
             "#!/bin/sh\n\
              if [ \"$1 $2 $3\" = \"auth status --json\" ]; then\n\
                printf '{\"loggedIn\":false}\\n'\n\
              fi\n\
              exit 0\n",
-        )
-        .unwrap();
-        fs::set_permissions(&fake_claude, fs::Permissions::from_mode(0o755)).unwrap();
-
-        {
-            let _lock = StateLock::acquire(&paths).unwrap();
-            let mut initial = state::load(&paths).unwrap();
-            initial.real_claude = Some(fake_claude);
-            state::save(&paths, &initial).unwrap();
-        }
+        );
+        configure_real_claude(&paths, &fake_claude);
 
         let error = add(&paths, "work", None, false, false).unwrap_err();
         assert!(error.to_string().contains("did not report a valid login"));
         assert!(!state::load(&paths).unwrap().profiles.contains_key("work"));
         assert!(!paths.profile_dir("work").join(".claude.json").exists());
+    }
+
+    #[test]
+    fn add_aborts_before_login_when_credential_storage_is_shared() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_roots(temp.path().join("config"), temp.path().join("data"));
+        let fake_claude = temp.path().join("claude-real");
+        let shared = temp.path().join("shared-credentials");
+        install_fake_claude(&fake_claude, &shared_storage_fake_claude(&shared));
+        configure_real_claude(&paths, &fake_claude);
+        fs::write(&shared, b"an existing login").unwrap();
+
+        let error = add(&paths, "work", None, false, false).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("shares credentials across profiles"),
+            "{error:#}"
+        );
+        assert!(!paths.profile_dir("work").exists());
+        assert!(!state::load(&paths).unwrap().profiles.contains_key("work"));
+    }
+
+    #[test]
+    fn add_aborts_when_login_lands_in_shared_storage() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_roots(temp.path().join("config"), temp.path().join("data"));
+        let fake_claude = temp.path().join("claude-real");
+        let shared = temp.path().join("shared-credentials");
+        install_fake_claude(&fake_claude, &shared_storage_fake_claude(&shared));
+        configure_real_claude(&paths, &fake_claude);
+
+        let error = add(&paths, "work", None, false, false).unwrap_err();
+        assert!(
+            error.to_string().contains("shared credential storage"),
+            "{error:#}"
+        );
+        assert!(!state::load(&paths).unwrap().profiles.contains_key("work"));
+    }
+
+    #[test]
+    fn adopt_registers_a_directory_without_modifying_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_roots(temp.path().join("config"), temp.path().join("data"));
+        let fake_claude = temp.path().join("claude-real");
+        let log = temp.path().join("calls.log");
+        install_fake_claude(&fake_claude, &namespaced_fake_claude(&log));
+        configure_real_claude(&paths, &fake_claude);
+
+        let external = temp.path().join("external-claude-dir");
+        fs::create_dir_all(&external).unwrap();
+        fs::write(external.join(".fake-credentials"), b"logged in").unwrap();
+        fs::write(external.join("settings.json"), b"{}").unwrap();
+
+        adopt(&paths, "work", &external).unwrap();
+
+        let state = state::load(&paths).unwrap();
+        assert_eq!(state.active.as_deref(), Some("work"));
+        assert_eq!(state.profiles["work"].config_dir, external);
+        assert!(!external.join(".claude.json").exists());
+
+        let error = adopt(&paths, "work-again", &external).unwrap_err();
+        assert!(
+            error.to_string().contains("already registered"),
+            "{error:#}"
+        );
+        let dotted = temp
+            .path()
+            .join("nested")
+            .join("..")
+            .join("external-claude-dir");
+        let error = adopt(&paths, "work-dotted", &dotted).unwrap_err();
+        assert!(
+            error.to_string().contains("already registered"),
+            "a `..` spelling of a registered directory must be detected: {error:#}"
+        );
+        let error = adopt(&paths, "work", temp.path()).unwrap_err();
+        assert!(error.to_string().contains("already exists"), "{error:#}");
+    }
+
+    #[test]
+    fn adopt_normalizes_dot_and_parent_segments() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("external")).unwrap();
+        let with_slash = format!("{}/external/", temp.path().display());
+        assert_eq!(
+            normalize_adopted_directory(Path::new(&with_slash)).unwrap(),
+            temp.path().join("external")
+        );
+        let with_parent = format!("{}/nested/../external", temp.path().display());
+        assert_eq!(
+            normalize_adopted_directory(Path::new(&with_parent)).unwrap(),
+            temp.path().join("external")
+        );
+        assert!(normalize_adopted_directory(Path::new("/..")).is_err());
+    }
+
+    #[test]
+    fn adopt_aborts_when_credential_storage_is_shared() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_roots(temp.path().join("config"), temp.path().join("data"));
+        let fake_claude = temp.path().join("claude-real");
+        let shared = temp.path().join("shared-credentials");
+        install_fake_claude(&fake_claude, &shared_storage_fake_claude(&shared));
+        configure_real_claude(&paths, &fake_claude);
+        fs::write(&shared, b"an existing login").unwrap();
+
+        let external = temp.path().join("external-claude-dir");
+        fs::create_dir_all(&external).unwrap();
+        let error = adopt(&paths, "work", &external).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("shares credentials across profiles"),
+            "{error:#}"
+        );
+        assert!(!state::load(&paths).unwrap().profiles.contains_key("work"));
+    }
+
+    #[test]
+    fn remove_rejects_purge_combined_with_keep_login() {
+        let result = AccountCli::try_parse_from([
+            "claude account",
+            "remove",
+            "work",
+            "--purge",
+            "--yes",
+            "--keep-login",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn remove_keeps_adopted_directories_logged_in() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_roots(temp.path().join("config"), temp.path().join("data"));
+        let fake_claude = temp.path().join("claude-real");
+        let log = temp.path().join("calls.log");
+        install_fake_claude(&fake_claude, &namespaced_fake_claude(&log));
+        configure_real_claude(&paths, &fake_claude);
+
+        let external = temp.path().join("external-claude-dir");
+        fs::create_dir_all(&external).unwrap();
+        adopt(&paths, "work", &external).unwrap();
+
+        remove(&paths, "work", false, true, false).unwrap();
+        assert!(external.is_dir());
+        assert!(!state::load(&paths).unwrap().profiles.contains_key("work"));
+        let calls = fs::read_to_string(&log).unwrap();
+        assert!(
+            !calls.contains("auth logout"),
+            "adopted profile must not be logged out: {calls}"
+        );
+    }
+
+    #[test]
+    fn remove_with_keep_login_skips_logout() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_roots(temp.path().join("config"), temp.path().join("data"));
+        let fake_claude = temp.path().join("claude-real");
+        let log = temp.path().join("calls.log");
+        install_fake_claude(&fake_claude, &namespaced_fake_claude(&log));
+        configure_real_claude(&paths, &fake_claude);
+
+        add(&paths, "work", None, false, false).unwrap();
+        remove(&paths, "work", false, true, true).unwrap();
+        assert!(!state::load(&paths).unwrap().profiles.contains_key("work"));
+        let calls = fs::read_to_string(&log).unwrap();
+        assert!(!calls.contains("auth logout"), "{calls}");
+    }
+
+    #[test]
+    fn remove_refuses_to_purge_adopted_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_roots(temp.path().join("config"), temp.path().join("data"));
+        let fake_claude = temp.path().join("claude-real");
+        let log = temp.path().join("calls.log");
+        install_fake_claude(&fake_claude, &namespaced_fake_claude(&log));
+        configure_real_claude(&paths, &fake_claude);
+
+        let external = temp.path().join("external-claude-dir");
+        fs::create_dir_all(&external).unwrap();
+        adopt(&paths, "work", &external).unwrap();
+
+        let error = remove(&paths, "work", true, true, false).unwrap_err();
+        assert!(error.to_string().contains("refusing to purge"), "{error:#}");
+        assert!(external.is_dir());
+        assert!(
+            state::load(&paths).unwrap().profiles.contains_key("work"),
+            "profile must remain registered when purge is refused"
+        );
     }
 }

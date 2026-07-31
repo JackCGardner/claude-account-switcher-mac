@@ -14,7 +14,7 @@ Thank you for helping improve claude-account.
 
 Requirements:
 
-- Linux
+- Linux or macOS
 - Rust 1.85 or newer
 - Claude Code only when manually testing real authentication
 

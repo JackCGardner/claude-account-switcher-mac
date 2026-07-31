@@ -1,5 +1,5 @@
 blank_issues_enabled: false
 contact_links:
   - name: Private security report
-    url: https://github.com/hamzarehmandeveloper/claude-account/security/advisories/new
+    url: https://github.com/JackCGardner/claude-account-switcher-mac/security/advisories/new
     about: Privately report credential, execution, traversal, or deletion vulnerabilities.

@@ -1,14 +1,14 @@
 [package]
 name = "claude-account"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
-description = "Linux profile switcher for multiple Claude Code accounts"
-authors = ["Hamza Rehman"]
+description = "Profile switcher for multiple Claude Code accounts on Linux and macOS"
+authors = ["Hamza Rehman", "Jack Gardner"]
 license = "MIT"
 readme = "README.md"
-homepage = "https://github.com/hamzarehmandeveloper/claude-account"
-repository = "https://github.com/hamzarehmandeveloper/claude-account"
+homepage = "https://github.com/JackCGardner/claude-account-switcher-mac"
+repository = "https://github.com/JackCGardner/claude-account-switcher-mac"
 keywords = ["claude-code", "profiles", "account-switcher", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 

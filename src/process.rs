@@ -4,9 +4,11 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
+use serde::Deserialize;
 
 use crate::paths::AppPaths;
 use crate::state;
@@ -41,7 +43,22 @@ pub fn exec_active_profile(paths: &AppPaths, arguments: &[OsString]) -> Result<(
 
 pub fn managed_command(real_claude: &Path, config_dir: &Path) -> Command {
     let mut command = Command::new(real_claude);
-    command.env("CLAUDE_CONFIG_DIR", config_dir);
+
+    if is_default_claude_config_dir(
+        config_dir,
+        env::var_os("HOME").map(PathBuf::from).as_deref(),
+    ) {
+        // Claude Code derives its credential-storage key from CLAUDE_CONFIG_DIR
+        // when the variable is set, so pointing it at ~/.claude selects a
+        // different keychain entry than leaving it unset. Unset it to reach the
+        // same credentials as a plain `claude` invocation.
+        command.env_remove("CLAUDE_CONFIG_DIR");
+    } else {
+        command.env("CLAUDE_CONFIG_DIR", config_dir);
+    }
+    // An inherited storage override would re-key credentials away from the
+    // profile directory chosen above.
+    command.env_remove("CLAUDE_SECURESTORAGE_CONFIG_DIR");
 
     if env::var_os("CLAUDE_ACCOUNT_PRESERVE_AUTH_ENV").as_deref() != Some("1".as_ref()) {
         for variable in AUTH_ENVIRONMENT {
@@ -49,6 +66,81 @@ pub fn managed_command(real_claude: &Path, config_dir: &Path) -> Command {
         }
     }
     command
+}
+
+pub fn is_default_claude_config_dir(config_dir: &Path, home: Option<&Path>) -> bool {
+    home.is_some_and(|home| home.join(".claude") == config_dir)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AuthStatus {
+    #[serde(rename = "loggedIn")]
+    pub logged_in: bool,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default, rename = "subscriptionType")]
+    pub subscription_type: Option<String>,
+}
+
+pub fn auth_status(real_claude: &Path, config_dir: &Path, quiet: bool) -> Result<AuthStatus> {
+    auth_status_from(managed_command(real_claude, config_dir), quiet)
+}
+
+fn auth_status_from(mut command: Command, quiet: bool) -> Result<AuthStatus> {
+    let output = command
+        .args(["auth", "status", "--json"])
+        .stdout(Stdio::piped())
+        .stderr(if quiet {
+            Stdio::null()
+        } else {
+            Stdio::inherit()
+        })
+        .output()
+        .context("failed to run Claude auth status")?;
+    // Claude Code exits nonzero when logged out while still printing valid
+    // JSON, so the payload decides; the exit code only matters when the
+    // output is unusable.
+    match serde_json::from_slice(&output.stdout) {
+        Ok(status) => Ok(status),
+        Err(_) if !output.status.success() => {
+            bail!("`claude auth status --json` exited unsuccessfully")
+        }
+        Err(error) => {
+            Err(error).context("Claude returned an invalid response from `auth status --json`")
+        }
+    }
+}
+
+/// Probe whether a brand-new, empty configuration directory already sees an
+/// existing login. With per-profile credential storage this is always false;
+/// `Some(true)` means this Claude Code build shares credentials across
+/// configuration directories, so profiles cannot be isolated. `None` means the
+/// probe was inconclusive (for example, a Claude build without `auth status`).
+pub fn fresh_dir_sees_login(real_claude: &Path, paths: &AppPaths) -> Option<bool> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let probe_dir =
+        paths
+            .profiles_dir
+            .join(format!(".isolation-probe.{}.{}", std::process::id(), nonce));
+    if state::ensure_private_dir(&probe_dir).is_err() {
+        return None;
+    }
+    // The probe asks whether *stored* credentials leak into a fresh
+    // directory, so environment-token auth must never influence it — even
+    // when the user opted into CLAUDE_ACCOUNT_PRESERVE_AUTH_ENV=1.
+    let mut command = managed_command(real_claude, &probe_dir);
+    for variable in AUTH_ENVIRONMENT {
+        command.env_remove(variable);
+    }
+    let status = auth_status_from(command, true);
+    let _ = fs::remove_dir_all(&probe_dir);
+    match status {
+        Ok(status) => Some(status.logged_in),
+        Err(_) => None,
+    }
 }
 
 pub fn resolve_real_claude(
@@ -108,4 +200,30 @@ fn validate_distinct_executable(candidate: &Path, current_executable: &Path) -> 
         bail!("candidate points back to the claude-account wrapper");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_dir_detection_ignores_trailing_slashes() {
+        let home = Path::new("/home/user");
+        assert!(is_default_claude_config_dir(
+            Path::new("/home/user/.claude"),
+            Some(home)
+        ));
+        assert!(is_default_claude_config_dir(
+            Path::new("/home/user/.claude/"),
+            Some(home)
+        ));
+        assert!(!is_default_claude_config_dir(
+            Path::new("/home/user/.claude-work"),
+            Some(home)
+        ));
+        assert!(!is_default_claude_config_dir(
+            Path::new("/home/user/.claude"),
+            None
+        ));
+    }
 }

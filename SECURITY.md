@@ -13,7 +13,7 @@ deletion vulnerability.
 
 Include:
 
-- The affected version and Linux distribution
+- The affected version and operating system (Linux distribution or macOS version)
 - Reproduction steps using placeholder credentials
 - The expected and observed behavior
 - Any proposed fix, if available
