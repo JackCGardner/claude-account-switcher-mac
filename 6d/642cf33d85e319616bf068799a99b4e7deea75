@@ -1,0 +1,20 @@
+src/claude_json.rs
+  s_6b8b977fbd0014::t_267cf65d922cd3 4-6,11-75,81
+  s_6b8b977fbd0014::t_83ff9f0abde73b 254-308
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "6d642cf33d85e319616bf068799a99b4e7deea75",
+  "prompts": {},
+  "sessions": {
+    "s_6b8b977fbd0014": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "67f56396-3120-4a28-86db-2e14895ff378",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Jack Gardner <6323352+Mortifera@users.noreply.github.com>"
+    }
+  }
+}
