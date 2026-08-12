@@ -80,6 +80,19 @@ enum AccountCommand {
         #[arg(long)]
         live: bool,
     },
+    /// Full-screen auto-refreshing comparison of every login: workspaces
+    /// with their members, standalone profiles, usage bars, watch status
+    Dashboard {
+        /// Query the usage API with each login's keychain token (read-only)
+        #[arg(long)]
+        live: bool,
+        /// Seconds between refreshes (default 15)
+        #[arg(long)]
+        interval: Option<u64>,
+        /// Print one frame and exit
+        #[arg(long)]
+        once: bool,
+    },
     /// Watch a workspace and rotate its selected member before a usage
     /// window hits its limit (settings persist per workspace)
     Watch {
@@ -163,6 +176,11 @@ impl AccountCli {
             }
             AccountCommand::Unmap { directory } => unmap(paths, &directory),
             AccountCommand::Usage { live } => crate::usage::command_usage(paths, live),
+            AccountCommand::Dashboard {
+                live,
+                interval,
+                once,
+            } => crate::dashboard::command_dashboard(paths, live, interval, once),
             AccountCommand::Watch {
                 workspace,
                 threshold,

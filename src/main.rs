@@ -1,5 +1,6 @@
 mod account;
 mod claude_json;
+mod dashboard;
 mod keychain;
 mod paths;
 mod process;
