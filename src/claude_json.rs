@@ -1,17 +1,84 @@
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde_json::{Map, Value};
+
+/// How long a held `.claude.json.lock` may block us. Claude Code holds the
+/// config lock for milliseconds per write, so anything longer is either a
+/// stale artifact (handled separately) or a wedged process — proceed then,
+/// since our write is atomic either way.
+const LOCK_WAIT: Duration = Duration::from_millis(1_500);
+/// Claude Code's proper-lockfile options for the config lock: stale after
+/// 10s, holders touch it every 5s.
+const LOCK_STALE: Duration = Duration::from_secs(10);
+
+/// Cooperate with Claude Code's own advisory lock around `.claude.json`
+/// writes: a *directory* next to the file whose mkdir is the mutex (the npm
+/// `proper-lockfile` protocol, verified by the claude-swap project against
+/// the Claude Code 2.1.218 bundle). Holding it while we read-modify-write
+/// stops a running session's own config write from landing in between.
+struct ConfigLock {
+    path: PathBuf,
+    held: bool,
+}
+
+impl ConfigLock {
+    fn acquire(config_path: &Path) -> ConfigLock {
+        let path = PathBuf::from(format!("{}.lock", config_path.display()));
+        let deadline = Instant::now() + LOCK_WAIT;
+        loop {
+            match fs::create_dir(&path) {
+                Ok(()) => return ConfigLock { path, held: true },
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                    let stale = fs::metadata(&path)
+                        .and_then(|metadata| metadata.modified())
+                        .map(|modified| {
+                            SystemTime::now()
+                                .duration_since(modified)
+                                .unwrap_or_default()
+                                > LOCK_STALE
+                        })
+                        .unwrap_or(true);
+                    if stale {
+                        let _ = fs::remove_dir_all(&path);
+                        continue;
+                    }
+                    if Instant::now() >= deadline {
+                        eprintln!(
+                            "warning: {} is held by a running Claude; updating without it",
+                            path.display()
+                        );
+                        return ConfigLock { path, held: false };
+                    }
+                    thread::sleep(Duration::from_millis(150));
+                }
+                // Not being able to lock (permissions, missing directory)
+                // never blocks the update itself.
+                Err(_) => return ConfigLock { path, held: false },
+            }
+        }
+    }
+}
+
+impl Drop for ConfigLock {
+    fn drop(&mut self) {
+        if self.held {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
 
 /// Apply `mutate` to `<profile_dir>/.claude.json`, creating the file when it
 /// does not exist. Claude Code keeps its top-level state in this file, so all
 /// unrelated fields are preserved and the write is atomic and private (0600).
 pub fn update(profile_dir: &Path, mutate: impl FnOnce(&mut Map<String, Value>)) -> Result<()> {
     let config_path = profile_dir.join(".claude.json");
+    let _lock = ConfigLock::acquire(&config_path);
     let mut config = match fs::read(&config_path) {
         Ok(contents) => serde_json::from_slice::<Value>(&contents)
             .with_context(|| format!("failed to parse {}", config_path.display()))?,
@@ -182,6 +249,61 @@ mod tests {
         write_identity(&profile, &identity_a).unwrap();
         let restored = read_identity(&profile).unwrap().unwrap();
         assert_eq!(identity_email(&restored), Some("a@example.com"));
+    }
+
+    #[test]
+    fn updates_take_and_release_the_config_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join("profile");
+        state::ensure_private_dir(&profile).unwrap();
+
+        complete_onboarding(&profile).unwrap();
+        assert!(
+            !profile.join(".claude.json.lock").exists(),
+            "the lock must be released after the update"
+        );
+    }
+
+    #[test]
+    fn stale_config_locks_are_taken_over() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join("profile");
+        state::ensure_private_dir(&profile).unwrap();
+        let lock_dir = profile.join(".claude.json.lock");
+        fs::create_dir(&lock_dir).unwrap();
+        // Backdate the lock beyond the 10s staleness horizon.
+        let status = std::process::Command::new("touch")
+            .args(["-t", "202001010000"])
+            .arg(&lock_dir)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let started = std::time::Instant::now();
+        complete_onboarding(&profile).unwrap();
+        assert!(
+            started.elapsed() < super::LOCK_WAIT,
+            "a stale lock must be taken over immediately"
+        );
+        assert!(!lock_dir.exists());
+    }
+
+    #[test]
+    fn held_config_locks_do_not_block_forever() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join("profile");
+        state::ensure_private_dir(&profile).unwrap();
+        let lock_dir = profile.join(".claude.json.lock");
+        fs::create_dir(&lock_dir).unwrap(); // fresh mtime = actively held
+
+        complete_onboarding(&profile).unwrap();
+        let config: Value =
+            serde_json::from_slice(&fs::read(profile.join(".claude.json")).unwrap()).unwrap();
+        assert_eq!(config["hasCompletedOnboarding"], true);
+        assert!(
+            lock_dir.exists(),
+            "a live holder's lock must not be removed by the fallback path"
+        );
     }
 
     #[test]
