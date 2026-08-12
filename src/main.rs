@@ -1,7 +1,13 @@
 mod account;
+mod claude_json;
+mod dashboard;
+mod keychain;
 mod paths;
 mod process;
 mod state;
+mod usage;
+mod watch;
+mod workspace;
 
 use std::env;
 use std::ffi::OsString;

@@ -2,22 +2,30 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::paths::AppPaths;
 
 const LOCK_EX: i32 = 2;
 
+/// Refuse to follow a symlink planted at the fixed lock path (defense in
+/// depth; the config dir is 0700).
+#[cfg(target_os = "macos")]
+const O_NOFOLLOW: i32 = 0x0100;
+#[cfg(not(target_os = "macos"))]
+const O_NOFOLLOW: i32 = 0o400000;
+
 unsafe extern "C" {
     fn flock(fd: i32, operation: i32) -> i32;
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct State {
     #[serde(default = "state_version")]
     pub version: u32,
@@ -27,30 +35,191 @@ pub struct State {
     pub real_claude: Option<PathBuf>,
     #[serde(default)]
     pub profiles: BTreeMap<String, Profile>,
+    /// Shared workspaces: one directory used by several member profiles, each
+    /// with its own login. Absent entirely in version-1 state files.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub workspaces: BTreeMap<String, Workspace>,
+    /// Directory bindings: `claude` launched inside a bound directory (or any
+    /// descendant) targets the bound profile or workspace automatically.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mappings: BTreeMap<PathBuf, String>,
+}
+
+impl State {
+    /// Workspaces and directory bindings are features an older binary would
+    /// silently drop on save, so their presence bumps the persisted version.
+    fn uses_workspaces(&self) -> bool {
+        !self.workspaces.is_empty()
+            || !self.mappings.is_empty()
+            || self.profiles.values().any(|profile| {
+                profile.workspace.is_some()
+                    || profile.identity.is_some()
+                    || profile.last_usage.is_some()
+            })
+    }
+
+    /// The target bound to the deepest registered ancestor of `directory`.
+    pub fn mapped_target(&self, directory: &Path) -> Option<&str> {
+        self.mappings
+            .iter()
+            .filter(|(bound, _)| directory.starts_with(bound))
+            .max_by_key(|(bound, _)| bound.components().count())
+            .map(|(_, target)| target.as_str())
+    }
+
+    /// Resolve a launch target to the profile Claude should run as. A
+    /// workspace name resolves through the workspace's selected member;
+    /// anything else must be a profile name. Profile and workspace names
+    /// never collide (creation refuses duplicates across both namespaces).
+    pub fn resolve_target(&self, target: &str) -> Result<(String, &Profile)> {
+        if let Some(workspace) = self.workspaces.get(target) {
+            let member = workspace.selected.as_deref().with_context(|| {
+                format!(
+                    "workspace `{target}` has no selected member; pick one with \
+                     `claude account use MEMBER`"
+                )
+            })?;
+            let profile = self.profiles.get(member).with_context(|| {
+                format!("workspace `{target}` selects `{member}`, which no longer exists")
+            })?;
+            return Ok((member.to_owned(), profile));
+        }
+        let profile = self
+            .profiles
+            .get(target)
+            .with_context(|| format!("`{target}` is not a registered profile or workspace"))?;
+        Ok((target.to_owned(), profile))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Workspace {
+    pub dir: PathBuf,
+    pub created_at: u64,
+    /// The directory pre-existed as a profile's own directory (created with
+    /// `--from-profile`); it is never deleted by workspace removal.
+    #[serde(default)]
+    pub external: bool,
+    /// The member profile that launches targeting this workspace resolve to;
+    /// `claude account use MEMBER` and `claude account watch` change it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected: Option<String>,
+    /// Persisted `claude account watch` settings for this workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<WatchSettings>,
+    /// Unix time of the last automatic rotation (anti-flap cooldown).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_rotated_at: Option<u64>,
+}
+
+impl Workspace {
+    pub fn new(dir: PathBuf, external: bool) -> Self {
+        Self {
+            dir,
+            created_at: unix_now(),
+            external,
+            selected: None,
+            watch: None,
+            last_rotated_at: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchSettings {
+    /// Rotate when any gating window reaches this percentage.
+    pub threshold: f64,
+    /// consume-first | best | next-available
+    pub strategy: String,
+    /// Which per-model weekly windows gate: "all", "none", or a
+    /// comma-separated list of model names.
+    pub models: String,
+    /// Poll the usage API with each member's keychain token instead of
+    /// relying on Claude's cached snapshots.
+    #[serde(default)]
+    pub live: bool,
+    /// Base seconds between checks.
+    #[serde(default = "default_watch_interval")]
+    pub interval_secs: u64,
+}
+
+fn default_watch_interval() -> u64 {
+    60
+}
+
+impl Default for WatchSettings {
+    fn default() -> Self {
+        Self {
+            threshold: 90.0,
+            strategy: "consume-first".to_owned(),
+            models: "all".to_owned(),
+            live: false,
+            interval_secs: default_watch_interval(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
     pub config_dir: PathBuf,
     pub created_at: u64,
+    /// The directory pre-existed claude-account and is only registered, not
+    /// managed; 0.1.1 state files deserialize as managed.
+    #[serde(default)]
+    pub adopted: bool,
+    /// Name of the workspace this profile is a member of, when any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    /// The `oauthAccount`/`userID` identity metadata Claude Code stored in the
+    /// shared `.claude.json` for this member's login. Never contains tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<Value>,
+    /// The last usage windows observed for this login (written by `watch`),
+    /// so an idle workspace member keeps known — decaying — usage numbers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_usage: Option<Value>,
 }
 
 impl Profile {
     pub fn new(config_dir: PathBuf) -> Self {
-        let created_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        Self::create(config_dir, false)
+    }
+
+    pub fn new_adopted(config_dir: PathBuf) -> Self {
+        Self::create(config_dir, true)
+    }
+
+    pub fn new_member(config_dir: PathBuf, workspace: String, identity: Option<Value>) -> Self {
+        let mut profile = Self::create(config_dir, false);
+        profile.workspace = Some(workspace);
+        profile.identity = identity;
+        profile
+    }
+
+    fn create(config_dir: PathBuf, adopted: bool) -> Self {
         Self {
             config_dir,
-            created_at,
+            created_at: unix_now(),
+            adopted,
+            workspace: None,
+            identity: None,
+            last_usage: None,
         }
     }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn state_version() -> u32 {
     1
 }
+
+const MAX_STATE_VERSION: u32 = 2;
 
 pub struct StateLock {
     _file: File,
@@ -65,6 +234,7 @@ impl StateLock {
             .write(true)
             .truncate(false)
             .mode(0o600)
+            .custom_flags(O_NOFOLLOW)
             .open(&paths.lock_file)
             .with_context(|| format!("failed to open {}", paths.lock_file.display()))?;
 
@@ -88,8 +258,11 @@ pub fn load(paths: &AppPaths) -> Result<State> {
         Ok(file) => {
             let state: State = serde_json::from_reader(file)
                 .with_context(|| format!("failed to parse {}", paths.state_file.display()))?;
-            if state.version != 1 {
-                anyhow::bail!("unsupported state version {}", state.version);
+            if !(1..=MAX_STATE_VERSION).contains(&state.version) {
+                anyhow::bail!(
+                    "unsupported state version {} (created by a newer claude-account?)",
+                    state.version
+                );
             }
             Ok(state)
         }
@@ -105,6 +278,15 @@ pub fn load(paths: &AppPaths) -> Result<State> {
 
 pub fn save(paths: &AppPaths, state: &State) -> Result<()> {
     ensure_private_dir(&paths.config_dir)?;
+    // Persist the lowest version that can represent the state, so an older
+    // binary keeps working until workspaces are actually used and refuses the
+    // file (instead of silently dropping fields) afterwards.
+    let mut snapshot = state.clone();
+    snapshot.version = if snapshot.uses_workspaces() {
+        MAX_STATE_VERSION
+    } else {
+        1
+    };
     let temporary = temporary_state_path(&paths.state_file);
     let result = (|| -> Result<()> {
         let mut file = OpenOptions::new()
@@ -113,7 +295,7 @@ pub fn save(paths: &AppPaths, state: &State) -> Result<()> {
             .mode(0o600)
             .open(&temporary)
             .with_context(|| format!("failed to create {}", temporary.display()))?;
-        serde_json::to_writer_pretty(&mut file, state).context("failed to serialize state")?;
+        serde_json::to_writer_pretty(&mut file, &snapshot).context("failed to serialize state")?;
         file.write_all(b"\n")
             .context("failed to finish state file")?;
         file.sync_all().context("failed to sync state file")?;
@@ -136,7 +318,12 @@ pub fn save(paths: &AppPaths, state: &State) -> Result<()> {
 }
 
 pub fn ensure_private_dir(path: &Path) -> Result<()> {
-    fs::create_dir_all(path)
+    // The mode is applied at mkdir time (no create-then-chmod window); the
+    // set_permissions afterwards covers pre-existing directories.
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
         .with_context(|| format!("failed to create directory {}", path.display()))?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
         .with_context(|| format!("failed to protect directory {}", path.display()))?;
@@ -160,6 +347,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn profiles_from_0_1_1_state_files_load_as_managed() {
+        let profile: Profile = serde_json::from_str(
+            r#"{"config_dir":"/home/user/.local/share/claude-account/profiles/work","created_at":1}"#,
+        )
+        .unwrap();
+        assert!(!profile.adopted);
+    }
+
+    #[test]
     fn state_round_trip_preserves_profiles() {
         let temp = tempfile::tempdir().unwrap();
         let paths = AppPaths::from_roots(temp.path().join("config"), temp.path().join("data"));
@@ -178,5 +374,72 @@ mod tests {
 
         assert_eq!(loaded.active.as_deref(), Some("work"));
         assert!(loaded.profiles.contains_key("work"));
+    }
+
+    #[test]
+    fn workspaces_bump_the_saved_state_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_roots(temp.path().join("config"), temp.path().join("data"));
+        let mut state = State {
+            version: 1,
+            ..State::default()
+        };
+        state
+            .profiles
+            .insert("work".to_owned(), Profile::new(paths.profile_dir("work")));
+
+        let _lock = StateLock::acquire(&paths).unwrap();
+        save(&paths, &state).unwrap();
+        let plain: Value = serde_json::from_slice(&fs::read(&paths.state_file).unwrap()).unwrap();
+        assert_eq!(plain["version"], 1);
+        assert!(plain.get("workspaces").is_none());
+
+        state.workspaces.insert(
+            "shared".to_owned(),
+            Workspace::new(temp.path().join("shared"), true),
+        );
+        save(&paths, &state).unwrap();
+        let versioned: Value =
+            serde_json::from_slice(&fs::read(&paths.state_file).unwrap()).unwrap();
+        assert_eq!(versioned["version"], 2);
+        let loaded = load(&paths).unwrap();
+        assert_eq!(loaded.workspaces["shared"].dir, temp.path().join("shared"));
+        assert!(loaded.workspaces["shared"].external);
+    }
+
+    #[test]
+    fn mapped_target_picks_the_deepest_bound_ancestor() {
+        let mut state = State::default();
+        state
+            .mappings
+            .insert(PathBuf::from("/home/user/dev"), "personal".to_owned());
+        state
+            .mappings
+            .insert(PathBuf::from("/home/user/dev/movo"), "work".to_owned());
+
+        assert_eq!(
+            state.mapped_target(Path::new("/home/user/dev/movo/app/src")),
+            Some("work")
+        );
+        assert_eq!(
+            state.mapped_target(Path::new("/home/user/dev/other")),
+            Some("personal")
+        );
+        assert_eq!(state.mapped_target(Path::new("/home/user/documents")), None);
+        // Component-wise matching: /home/user/dev-tools is not under /home/user/dev.
+        assert_eq!(state.mapped_target(Path::new("/home/user/dev-tools")), None);
+    }
+
+    #[test]
+    fn future_state_versions_are_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_roots(temp.path().join("config"), temp.path().join("data"));
+        ensure_private_dir(&paths.config_dir).unwrap();
+        fs::write(&paths.state_file, r#"{"version":3}"#).unwrap();
+        let error = load(&paths).unwrap_err();
+        assert!(
+            error.to_string().contains("unsupported state version 3"),
+            "{error:#}"
+        );
     }
 }

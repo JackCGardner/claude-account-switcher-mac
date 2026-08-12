@@ -2,3 +2,6 @@
 *.tmp
 .idea/
 .vscode/
+
+# Agent worktrees
+.claude/worktrees/
