@@ -1,0 +1,20 @@
+src/keychain.rs
+  s_6b8b977fbd0014::t_39819745ebb9f1 29-32
+  s_6b8b977fbd0014::t_cd930d8071bdfb 5
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "3d36dda8b4f395ac544efc9bd4ed115e5c9edd4e",
+  "prompts": {},
+  "sessions": {
+    "s_6b8b977fbd0014": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "67f56396-3120-4a28-86db-2e14895ff378",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Jack Gardner <6323352+Mortifera@users.noreply.github.com>"
+    }
+  }
+}
