@@ -1,8 +1,10 @@
 mod account;
 mod claude_json;
+mod keychain;
 mod paths;
 mod process;
 mod state;
+mod usage;
 mod workspace;
 
 use std::env;

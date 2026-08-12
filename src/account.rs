@@ -73,6 +73,13 @@ enum AccountCommand {
         /// The bound directory
         directory: PathBuf,
     },
+    /// Show each login's usage windows (5-hour, weekly, per-model weekly)
+    Usage {
+        /// Query the usage API with each login's keychain token (read-only)
+        /// instead of relying on Claude's cached snapshots
+        #[arg(long)]
+        live: bool,
+    },
     /// List registered profiles
     List {
         /// Also query each profile's login state, email, and plan
@@ -127,6 +134,7 @@ impl AccountCli {
                 map(paths, directory.as_deref(), target.as_deref())
             }
             AccountCommand::Unmap { directory } => unmap(paths, &directory),
+            AccountCommand::Usage { live } => crate::usage::command_usage(paths, live),
             AccountCommand::List { status } => list(paths, status),
             AccountCommand::Current => current(paths),
             AccountCommand::Remove {
