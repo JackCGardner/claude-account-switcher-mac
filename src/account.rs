@@ -1,4 +1,5 @@
 use std::env;
+use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
@@ -47,8 +48,31 @@ enum AccountCommand {
         /// The existing Claude configuration directory
         directory: PathBuf,
     },
-    /// Select the profile used by future Claude processes
+    /// Select the profile or workspace used by future Claude processes
     Use { name: String },
+    /// Launch Claude once as a specific profile or workspace, leaving the
+    /// default target unchanged
+    Run {
+        /// Profile or workspace name (a workspace runs its selected member)
+        name: String,
+        /// Arguments forwarded to Claude Code
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<OsString>,
+    },
+    /// Bind a directory to a profile or workspace so `claude` inside it (or
+    /// any subdirectory) targets it automatically; without arguments, list
+    /// all bindings
+    Map {
+        /// Directory to bind
+        directory: Option<PathBuf>,
+        /// Target profile or workspace name
+        target: Option<String>,
+    },
+    /// Remove a directory binding
+    Unmap {
+        /// The bound directory
+        directory: PathBuf,
+    },
     /// List registered profiles
     List {
         /// Also query each profile's login state, email, and plan
@@ -98,6 +122,11 @@ impl AccountCli {
             } => add(paths, &name, email.as_deref(), sso, console),
             AccountCommand::Adopt { name, directory } => adopt(paths, &name, &directory),
             AccountCommand::Use { name } => use_target(paths, &name),
+            AccountCommand::Run { name, arguments } => run_target(paths, &name, &arguments),
+            AccountCommand::Map { directory, target } => {
+                map(paths, directory.as_deref(), target.as_deref())
+            }
+            AccountCommand::Unmap { directory } => unmap(paths, &directory),
             AccountCommand::List { status } => list(paths, status),
             AccountCommand::Current => current(paths),
             AccountCommand::Remove {
@@ -228,7 +257,7 @@ fn add(paths: &AppPaths, name: &str, email: Option<&str>, sso: bool, console: bo
 
 pub(crate) fn adopt(paths: &AppPaths, name: &str, directory: &Path) -> Result<()> {
     validate_profile_name(name)?;
-    let directory = normalize_adopted_directory(directory)?;
+    let directory = normalize_directory(directory)?;
     let metadata = fs::metadata(&directory)
         .with_context(|| format!("cannot adopt {}", directory.display()))?;
     if !metadata.is_dir() {
@@ -340,7 +369,7 @@ fn ensure_unregistered(state: &state::State, name: &str, directory: &Path) -> Re
 /// credential-storage key from the literal path string, so the stored spelling
 /// must stay stable, and two spellings of the same directory must normalize
 /// identically.
-fn normalize_adopted_directory(directory: &Path) -> Result<PathBuf> {
+fn normalize_directory(directory: &Path) -> Result<PathBuf> {
     let absolute = if directory.is_absolute() {
         directory.to_path_buf()
     } else {
@@ -355,7 +384,7 @@ fn normalize_adopted_directory(directory: &Path) -> Result<PathBuf> {
             Component::ParentDir => {
                 if !normalized.pop() {
                     bail!(
-                        "cannot adopt {}: path escapes the filesystem root",
+                        "invalid path {}: escapes the filesystem root",
                         directory.display()
                     );
                 }
@@ -364,6 +393,64 @@ fn normalize_adopted_directory(directory: &Path) -> Result<PathBuf> {
         }
     }
     Ok(normalized)
+}
+
+fn run_target(paths: &AppPaths, name: &str, arguments: &[OsString]) -> Result<()> {
+    validate_profile_name(name)?;
+    let state = state::load(paths)?;
+    process::exec_target(&state, name, arguments)
+}
+
+fn map(paths: &AppPaths, directory: Option<&Path>, target: Option<&str>) -> Result<()> {
+    match (directory, target) {
+        (None, None) => {
+            let state = state::load(paths)?;
+            if state.mappings.is_empty() {
+                println!(
+                    "No directory bindings. Add one with `claude account map DIRECTORY TARGET`."
+                );
+                return Ok(());
+            }
+            for (bound, bound_target) in &state.mappings {
+                println!("{} -> {bound_target}", bound.display());
+            }
+            Ok(())
+        }
+        (Some(directory), Some(target)) => {
+            validate_profile_name(target)?;
+            let directory = normalize_directory(directory)?;
+            let metadata = fs::metadata(&directory)
+                .with_context(|| format!("cannot bind {}", directory.display()))?;
+            if !metadata.is_dir() {
+                bail!("cannot bind {}: not a directory", directory.display());
+            }
+            let _lock = StateLock::acquire(paths)?;
+            let mut state = state::load(paths)?;
+            if !state.profiles.contains_key(target) && !state.workspaces.contains_key(target) {
+                bail!("`{target}` is not a registered profile or workspace");
+            }
+            state.mappings.insert(directory.clone(), target.to_owned());
+            state::save(paths, &state)?;
+            println!(
+                "Bound {} -> `{target}`. `claude` inside it now targets `{target}`.",
+                directory.display()
+            );
+            Ok(())
+        }
+        _ => bail!("pass DIRECTORY and TARGET to bind, or no arguments to list bindings"),
+    }
+}
+
+fn unmap(paths: &AppPaths, directory: &Path) -> Result<()> {
+    let directory = normalize_directory(directory)?;
+    let _lock = StateLock::acquire(paths)?;
+    let mut state = state::load(paths)?;
+    if state.mappings.remove(&directory).is_none() {
+        bail!("no binding for {}", directory.display());
+    }
+    state::save(paths, &state)?;
+    println!("Removed the binding for {}.", directory.display());
+    Ok(())
 }
 
 /// `use NAME` where NAME is a workspace (target it, keeping or inferring its
@@ -579,6 +666,15 @@ pub(crate) fn remove(
         state.profiles.remove(name);
         if is_active && state.active.as_deref() == Some(name) {
             state.active = None;
+        }
+        let dropped_bindings = state
+            .mappings
+            .iter()
+            .filter(|(_, target)| target.as_str() == name)
+            .count();
+        if dropped_bindings > 0 {
+            state.mappings.retain(|_, target| target != name);
+            println!("Removed {dropped_bindings} directory binding(s) that targeted `{name}`.");
         }
         if let Some(workspace_name) = &profile.workspace {
             let remaining: Vec<String> = state
@@ -998,15 +1094,15 @@ mod tests {
         fs::create_dir_all(temp.path().join("external")).unwrap();
         let with_slash = format!("{}/external/", temp.path().display());
         assert_eq!(
-            normalize_adopted_directory(Path::new(&with_slash)).unwrap(),
+            normalize_directory(Path::new(&with_slash)).unwrap(),
             temp.path().join("external")
         );
         let with_parent = format!("{}/nested/../external", temp.path().display());
         assert_eq!(
-            normalize_adopted_directory(Path::new(&with_parent)).unwrap(),
+            normalize_directory(Path::new(&with_parent)).unwrap(),
             temp.path().join("external")
         );
-        assert!(normalize_adopted_directory(Path::new("/..")).is_err());
+        assert!(normalize_directory(Path::new("/..")).is_err());
     }
 
     #[test]
@@ -1029,6 +1125,39 @@ mod tests {
             "{error:#}"
         );
         assert!(!state::load(&paths).unwrap().profiles.contains_key("work"));
+    }
+
+    #[test]
+    fn map_binds_directories_and_cleans_up_on_removal() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_roots(temp.path().join("config"), temp.path().join("data"));
+        let fake_claude = temp.path().join("claude-real");
+        let log = temp.path().join("calls.log");
+        install_fake_claude(&fake_claude, &namespaced_fake_claude(&log));
+        configure_real_claude(&paths, &fake_claude);
+        add(&paths, "work", None, false, false).unwrap();
+
+        let project = temp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        map(&paths, Some(&project), Some("work")).unwrap();
+
+        let state = state::load(&paths).unwrap();
+        assert_eq!(state.mappings[&project], "work");
+        assert_eq!(state.mapped_target(&project.join("sub")), Some("work"));
+
+        let error = map(&paths, Some(&project), Some("missing")).unwrap_err();
+        assert!(error.to_string().contains("not a registered"), "{error:#}");
+
+        remove(&paths, "work", false, true, false).unwrap();
+        assert!(state::load(&paths).unwrap().mappings.is_empty());
+    }
+
+    #[test]
+    fn unmap_requires_an_existing_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_roots(temp.path().join("config"), temp.path().join("data"));
+        let error = unmap(&paths, &temp.path().join("nowhere")).unwrap_err();
+        assert!(error.to_string().contains("no binding"), "{error:#}");
     }
 
     #[test]

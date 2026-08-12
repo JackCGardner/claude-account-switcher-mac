@@ -111,6 +111,30 @@ fn complete_profile_lifecycle() {
     assert!(forwarded.contains("forwarded:fix this bug --model sonnet"));
     assert!(forwarded.contains(account_home.join("profiles/personal").to_str().unwrap()));
 
+    // `run` launches a specific profile once without changing the default
+    // target, and CLAUDE_ACCOUNT_PROFILE overrides resolution per launch.
+    let ran = run(
+        &shim,
+        &account_home,
+        &["account", "run", "work", "ping from run"],
+    );
+    let ran = String::from_utf8(ran.stdout).unwrap();
+    assert!(ran.contains("forwarded:ping from run"));
+    assert!(ran.contains(account_home.join("profiles/work").to_str().unwrap()));
+    let overridden = run_with_env(
+        &shim,
+        &account_home,
+        &["ping via env"],
+        &[("CLAUDE_ACCOUNT_PROFILE", "work")],
+    );
+    let overridden = String::from_utf8(overridden.stdout).unwrap();
+    assert!(overridden.contains(account_home.join("profiles/work").to_str().unwrap()));
+    let still_personal = run(&shim, &account_home, &["account", "current"]);
+    assert_eq!(
+        String::from_utf8(still_personal.stdout).unwrap().trim(),
+        "personal"
+    );
+
     run(&shim, &account_home, &["account", "remove", "work"]);
     assert!(account_home.join("profiles/work").is_dir());
 

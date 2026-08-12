@@ -28,25 +28,26 @@ pub const TARGET_ENVIRONMENT_VARIABLE: &str = "CLAUDE_ACCOUNT_PROFILE";
 
 pub fn exec_active_profile(paths: &AppPaths, arguments: &[OsString]) -> Result<()> {
     let state = state::load(paths)?;
-    let target = match env::var_os(TARGET_ENVIRONMENT_VARIABLE) {
-        Some(value) => value
+    let target = if let Some(value) = env::var_os(TARGET_ENVIRONMENT_VARIABLE) {
+        value
             .into_string()
             .ok()
-            .with_context(|| format!("{TARGET_ENVIRONMENT_VARIABLE} is not valid UTF-8"))?,
-        None => state.active.clone().context(
+            .with_context(|| format!("{TARGET_ENVIRONMENT_VARIABLE} is not valid UTF-8"))?
+    } else if let Some(mapped) = env::current_dir()
+        .ok()
+        .as_deref()
+        .and_then(|cwd| state.mapped_target(cwd))
+    {
+        mapped.to_owned()
+    } else {
+        state.active.clone().context(
             "no active profile; run `claude account add NAME` or `claude account use NAME`",
-        )?,
+        )?
     };
-    exec_target(paths, &state, &target, arguments)
+    exec_target(&state, &target, arguments)
 }
 
-pub fn exec_target(
-    paths: &AppPaths,
-    state: &state::State,
-    target: &str,
-    arguments: &[OsString],
-) -> Result<()> {
-    let _ = paths;
+pub fn exec_target(state: &state::State, target: &str, arguments: &[OsString]) -> Result<()> {
     let (profile_name, profile) = state.resolve_target(target)?;
     let real_claude = state
         .real_claude

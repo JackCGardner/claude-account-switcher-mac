@@ -535,6 +535,15 @@ fn remove(paths: &AppPaths, name: &str, purge: bool) -> Result<()> {
         // detached founding profile when there is one.
         state.active = founding.clone();
     }
+    let dropped_bindings = state
+        .mappings
+        .iter()
+        .filter(|(_, target)| target.as_str() == name)
+        .count();
+    if dropped_bindings > 0 {
+        state.mappings.retain(|_, target| target != name);
+        println!("Removed {dropped_bindings} directory binding(s) that targeted `{name}`.");
+    }
     state::save(paths, &state)?;
 
     if let Some(founding_name) = &founding {

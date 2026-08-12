@@ -32,17 +32,31 @@ pub struct State {
     /// with its own login. Absent entirely in version-1 state files.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub workspaces: BTreeMap<String, Workspace>,
+    /// Directory bindings: `claude` launched inside a bound directory (or any
+    /// descendant) targets the bound profile or workspace automatically.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mappings: BTreeMap<PathBuf, String>,
 }
 
 impl State {
-    /// Workspaces are the only feature an older binary would silently drop on
-    /// save, so their presence bumps the persisted version.
+    /// Workspaces and directory bindings are features an older binary would
+    /// silently drop on save, so their presence bumps the persisted version.
     fn uses_workspaces(&self) -> bool {
         !self.workspaces.is_empty()
+            || !self.mappings.is_empty()
             || self
                 .profiles
                 .values()
                 .any(|profile| profile.workspace.is_some() || profile.identity.is_some())
+    }
+
+    /// The target bound to the deepest registered ancestor of `directory`.
+    pub fn mapped_target(&self, directory: &Path) -> Option<&str> {
+        self.mappings
+            .iter()
+            .filter(|(bound, _)| directory.starts_with(bound))
+            .max_by_key(|(bound, _)| bound.components().count())
+            .map(|(_, target)| target.as_str())
     }
 
     /// Resolve a launch target to the profile Claude should run as. A
@@ -330,6 +344,29 @@ mod tests {
         let loaded = load(&paths).unwrap();
         assert_eq!(loaded.workspaces["shared"].dir, temp.path().join("shared"));
         assert!(loaded.workspaces["shared"].external);
+    }
+
+    #[test]
+    fn mapped_target_picks_the_deepest_bound_ancestor() {
+        let mut state = State::default();
+        state
+            .mappings
+            .insert(PathBuf::from("/home/user/dev"), "personal".to_owned());
+        state
+            .mappings
+            .insert(PathBuf::from("/home/user/dev/movo"), "work".to_owned());
+
+        assert_eq!(
+            state.mapped_target(Path::new("/home/user/dev/movo/app/src")),
+            Some("work")
+        );
+        assert_eq!(
+            state.mapped_target(Path::new("/home/user/dev/other")),
+            Some("personal")
+        );
+        assert_eq!(state.mapped_target(Path::new("/home/user/documents")), None);
+        // Component-wise matching: /home/user/dev-tools is not under /home/user/dev.
+        assert_eq!(state.mapped_target(Path::new("/home/user/dev-tools")), None);
     }
 
     #[test]
