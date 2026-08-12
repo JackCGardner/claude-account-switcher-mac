@@ -2,6 +2,7 @@
 //! credentials in. Used only by the opt-in live usage path; nothing here ever
 //! writes, deletes, or copies credentials anywhere.
 
+use std::fmt::Write as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -25,11 +26,10 @@ pub fn service_name(config_dir_value: Option<&str>) -> String {
         Some(value) => {
             let normalized: String = value.nfc().collect();
             let digest = Sha256::digest(normalized.as_bytes());
-            let suffix: String = digest
-                .iter()
-                .take(4)
-                .map(|byte| format!("{byte:02x}"))
-                .collect();
+            let mut suffix = String::with_capacity(8);
+            for byte in digest.iter().take(4) {
+                let _ = write!(suffix, "{byte:02x}");
+            }
             format!("Claude Code-credentials-{suffix}")
         }
     }
