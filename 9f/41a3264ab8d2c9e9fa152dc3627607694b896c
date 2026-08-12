@@ -1,0 +1,72 @@
+tests/e2e.rs
+  s_6b8b977fbd0014::t_bd3b3f60deaca1 173-258,264-318,324-330
+  s_6b8b977fbd0014::t_ed582c15422e1b 259-263,319-323
+src/process.rs
+  s_6b8b977fbd0014::t_6113b29f7bde2c 114-129,133,146,148
+src/account.rs
+  s_6b8b977fbd0014::t_8def426d7a32f5 111
+  s_6b8b977fbd0014::t_72391bebd782fb 149-157
+  s_6b8b977fbd0014::t_52a9129f4f4764 730
+  s_6b8b977fbd0014::t_8f4712ab6ff241 195
+  s_6b8b977fbd0014::t_5f77370e95eb1e 223
+  s_6b8b977fbd0014::t_9d89100f2df46a 542-561
+  s_6b8b977fbd0014::t_57ca7a0b477240 704-708,710-712,720
+  s_6b8b977fbd0014::t_560615e2db71a2 82-87
+  s_6b8b977fbd0014::t_be6023a228b550 360,367-371,373,376-388
+  s_6b8b977fbd0014::t_2333eb1fe9c6fc 408-410
+  s_6b8b977fbd0014::t_08f6b5b61c1ce6 317-325
+  s_6b8b977fbd0014::t_80d4d47bb207a8 447-453,455,463-476,496-499
+  s_6b8b977fbd0014::t_ed582c15422e1b 489-494
+  s_6b8b977fbd0014::t_738a4a3f946df1 579-583
+  s_6b8b977fbd0014::t_7a2537e868cbf7 9,13
+src/state.rs
+  s_6b8b977fbd0014::t_685f7e09a6eb6a 182-190,199
+  s_6b8b977fbd0014::t_9672933bdadc58 11,21,31-66,77-83,95-101,105,107-108,113-119,124
+  s_6b8b977fbd0014::t_c10b92df931e59 162-166
+  s_6b8b977fbd0014::t_08473ac764e01f 274-317
+  s_6b8b977fbd0014::t_6488b5997ab5f6 125
+src/paths.rs
+  s_6b8b977fbd0014::t_543f6779745c09 13
+  s_6b8b977fbd0014::t_f36a877629f939 52,64-66
+  s_6b8b977fbd0014::t_acda00520ce817 67
+Cargo.toml
+  s_6b8b977fbd0014::t_1c2fa61c6fb30c 3
+CHANGELOG.md
+  s_6b8b977fbd0014::t_495e9e28609c62 101-102
+  s_6b8b977fbd0014::t_322cd1d3f255f3 10-49
+README.md
+  s_6b8b977fbd0014::t_b6765ab8997fac 144-188
+  s_6b8b977fbd0014::t_28c3a526c079d4 15-16
+  s_6b8b977fbd0014::t_c181f90ba5f583 50-52,58-59,62-63
+  s_6b8b977fbd0014::t_b14f7cdd0ac213 292,300-308
+  s_6b8b977fbd0014::t_312678bdd431f7 38-42
+skills/claude-account/SKILL.md
+  s_6b8b977fbd0014::t_92ef87062674e6 1-114
+src/main.rs
+  s_6b8b977fbd0014::t_d92dc214dd8a57 2,6
+src/claude_json.rs
+  s_6b8b977fbd0014::t_948d5264f295fb 1-41,44-194
+  s_6b8b977fbd0014::t_ed582c15422e1b 42-43
+src/workspace.rs
+  s_6b8b977fbd0014::t_e7958fe7f58335 1-78,84-155,160-204,209-276,281-432,438-545,550-573,576-585,587-754,756-827,832-875,881-934,939-940
+  s_6b8b977fbd0014::t_ed582c15422e1b 79-83,156-159,205-208,277-280,433-437,546-549,755,828-831,876-880,935-938
+  s_6b8b977fbd0014::t_23b568b7ab47ad 574-575,586
+Cargo.lock
+  s_6b8b977fbd0014::t_bfb93c355bdba9 115
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "9f41a3264ab8d2c9e9fa152dc3627607694b896c",
+  "prompts": {},
+  "sessions": {
+    "s_6b8b977fbd0014": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "67f56396-3120-4a28-86db-2e14895ff378",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Jack Gardner <6323352+Mortifera@users.noreply.github.com>"
+    }
+  }
+}
