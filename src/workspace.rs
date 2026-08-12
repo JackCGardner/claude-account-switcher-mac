@@ -681,7 +681,7 @@ mod tests {
              if [ \"$1 $2\" = \"auth login\" ]; then\n\
                cat '{control}/next-email' > \"$cred\"\n\
                email=$(cat \"$cred\")\n\
-               printf '{{\"oauthAccount\":{{\"emailAddress\":\"%s\"}},\"userID\":\"uid-%s\"}}' \"$email\" \"$email\" > \"$CLAUDE_CONFIG_DIR/.claude.json\"\n\
+               printf '{{\"oauthAccount\":{{\"emailAddress\":\"%s\",\"accountUuid\":\"acct-%s\"}},\"userID\":\"uid-%s\"}}' \"$email\" \"$email\" \"$email\" > \"$CLAUDE_CONFIG_DIR/.claude.json\"\n\
                exit 0\n\
              fi\n\
              if [ \"$1 $2\" = \"auth logout\" ]; then\n\
@@ -1015,6 +1015,70 @@ mod tests {
         let raw: Value =
             serde_json::from_slice(&fs::read(&fixture.paths.state_file).unwrap()).unwrap();
         assert_eq!(raw["version"], 1);
+    }
+
+    #[test]
+    fn watch_once_rotates_to_the_member_with_headroom() {
+        let fixture = keychain_fixture();
+        fs::write(fixture.control.join("next-email"), "second@example.com").unwrap();
+        join(&fixture.paths, "work", "second", None, false, false).unwrap();
+
+        // Saturate the selected founder in the shared cached snapshot...
+        let config_path = fixture.external.join(".claude.json");
+        let mut doc: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        let now = crate::usage::unix_now();
+        doc["cachedUsageUtilization"] = serde_json::json!({
+            "fetchedAtMs": now * 1000,
+            "accountUuid": "acct-founder@example.com",
+            "utilization": {
+                "five_hour": {"utilization": 40, "resets_at": "2099-01-01T00:00:00Z"},
+                "seven_day": {"utilization": 96, "resets_at": "2099-01-02T00:00:00Z"}
+            }
+        });
+        fs::write(&config_path, serde_json::to_vec(&doc).unwrap()).unwrap();
+        // ...and give the idle member a known low observation.
+        {
+            let _lock = StateLock::acquire(&fixture.paths).unwrap();
+            let mut state = state::load(&fixture.paths).unwrap();
+            state.profiles.get_mut("second").unwrap().last_usage =
+                Some(crate::usage::stored_usage_to_value(
+                    now,
+                    &[crate::usage::Window {
+                        label: "7d".to_owned(),
+                        pct: 12.0,
+                        resets_at_unix: Some(now + 86_400),
+                        reset_since: false,
+                    }],
+                ));
+            state::save(&fixture.paths, &state).unwrap();
+        }
+
+        crate::watch::command_watch(
+            &fixture.paths,
+            "work",
+            None,
+            None,
+            None,
+            false,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+
+        let state = state::load(&fixture.paths).unwrap();
+        assert_eq!(state.workspaces["work"].selected.as_deref(), Some("second"));
+        assert!(state.workspaces["work"].last_rotated_at.is_some());
+        assert_eq!(
+            shared_claude_json(&fixture)["oauthAccount"]["emailAddress"],
+            "second@example.com"
+        );
+        // The founder's saturated numbers were recorded for its idle phase.
+        let founder_usage = state.profiles["founder"].last_usage.as_ref().unwrap();
+        let (_, windows) = crate::usage::stored_usage_from_value(founder_usage).unwrap();
+        assert!(windows
+            .iter()
+            .any(|window| window.label == "7d" && window.pct == 96.0));
     }
 
     #[test]

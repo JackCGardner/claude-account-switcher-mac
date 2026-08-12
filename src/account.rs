@@ -80,6 +80,34 @@ enum AccountCommand {
         #[arg(long)]
         live: bool,
     },
+    /// Watch a workspace and rotate its selected member before a usage
+    /// window hits its limit (settings persist per workspace)
+    Watch {
+        /// The workspace to watch
+        workspace: String,
+        /// Rotate when any gating window reaches this percent (default 90)
+        #[arg(long)]
+        threshold: Option<f64>,
+        /// How to pick the replacement member (default consume-first)
+        #[arg(long, value_enum)]
+        strategy: Option<crate::watch::Strategy>,
+        /// Per-model weekly windows that gate: `all`, `none`, or names such
+        /// as `fable,opus` (default all)
+        #[arg(long)]
+        models: Option<String>,
+        /// Poll the usage API with each member's keychain token (read-only)
+        #[arg(long, conflicts_with = "cached")]
+        live: bool,
+        /// Rely only on Claude's cached snapshots (turns --live back off)
+        #[arg(long)]
+        cached: bool,
+        /// Base seconds between checks (default 60)
+        #[arg(long)]
+        interval: Option<u64>,
+        /// Check once and exit
+        #[arg(long)]
+        once: bool,
+    },
     /// List registered profiles
     List {
         /// Also query each profile's login state, email, and plan
@@ -135,6 +163,18 @@ impl AccountCli {
             }
             AccountCommand::Unmap { directory } => unmap(paths, &directory),
             AccountCommand::Usage { live } => crate::usage::command_usage(paths, live),
+            AccountCommand::Watch {
+                workspace,
+                threshold,
+                strategy,
+                models,
+                live,
+                cached,
+                interval,
+                once,
+            } => crate::watch::command_watch(
+                paths, &workspace, threshold, strategy, models, live, cached, interval, once,
+            ),
             AccountCommand::List { status } => list(paths, status),
             AccountCommand::Current => current(paths),
             AccountCommand::Remove {

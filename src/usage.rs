@@ -24,7 +24,7 @@ use serde_json::Value;
 use crate::claude_json;
 use crate::keychain;
 use crate::paths::AppPaths;
-use crate::state::{self, Profile, State};
+use crate::state::{self, Profile, State, Workspace};
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const OAUTH_BETA_HEADER: &str = "oauth-2025-04-20";
@@ -52,6 +52,9 @@ pub struct MemberUsage {
     pub email: Option<String>,
     pub windows: Vec<Window>,
     pub source: Source,
+    /// When the underlying data was captured; lets `watch` persist the
+    /// freshest observation per member.
+    pub fetched_at_unix: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -279,6 +282,7 @@ fn member_usage(
     email: Option<String>,
     account_uuid: Option<&str>,
     shared_snapshot: Option<&(String, i64, Vec<Window>)>,
+    own_directory: bool,
 ) -> MemberUsage {
     if context.live {
         match fetch_live(context.paths, profile, context.home) {
@@ -289,6 +293,7 @@ fn member_usage(
                     email,
                     windows,
                     source: Source::Live,
+                    fetched_at_unix: Some(context.now),
                 };
             }
             Err(error) => {
@@ -297,12 +302,10 @@ fn member_usage(
         }
     }
     if let Some((snapshot_uuid, fetched_unix, windows)) = shared_snapshot {
-        // Without a recorded UUID (a standalone profile that never joined a
-        // workspace), the snapshot in the profile's own directory is its own.
-        let belongs_here = match account_uuid {
-            Some(uuid) => uuid == snapshot_uuid,
-            None => true,
-        };
+        // A standalone profile owns whatever snapshot sits in its own
+        // directory; a workspace member must match the snapshot's account
+        // UUID, because the shared file holds only the last login's data.
+        let belongs_here = own_directory || account_uuid == Some(snapshot_uuid.as_str());
         if belongs_here {
             let mut windows = windows.clone();
             apply_reset_decay(&mut windows, context.now);
@@ -313,14 +316,116 @@ fn member_usage(
                 source: Source::Cache {
                     age_secs: context.now.saturating_sub(*fetched_unix).max(0) as u64,
                 },
+                fetched_at_unix: Some(*fetched_unix),
             };
         }
+    }
+    if let Some((fetched_unix, mut windows)) = profile
+        .last_usage
+        .as_ref()
+        .and_then(stored_usage_from_value)
+    {
+        apply_reset_decay(&mut windows, context.now);
+        return MemberUsage {
+            profile: profile_name.to_owned(),
+            email,
+            windows,
+            source: Source::Cache {
+                age_secs: context.now.saturating_sub(fetched_unix).max(0) as u64,
+            },
+            fetched_at_unix: Some(fetched_unix),
+        };
     }
     MemberUsage {
         profile: profile_name.to_owned(),
         email,
         windows: Vec::new(),
         source: Source::Unavailable,
+        fetched_at_unix: None,
+    }
+}
+
+/// Serialize observed windows for `Profile::last_usage`.
+pub fn stored_usage_to_value(fetched_at_unix: i64, windows: &[Window]) -> Value {
+    serde_json::json!({
+        "fetched_at": fetched_at_unix,
+        "windows": windows
+            .iter()
+            .map(|window| {
+                serde_json::json!({
+                    "label": window.label,
+                    "pct": window.pct,
+                    "resets_at_unix": window.resets_at_unix,
+                })
+            })
+            .collect::<Vec<Value>>(),
+    })
+}
+
+pub fn stored_usage_from_value(value: &Value) -> Option<(i64, Vec<Window>)> {
+    let fetched_at = value.get("fetched_at")?.as_i64()?;
+    let mut windows = Vec::new();
+    for entry in value.get("windows")?.as_array()? {
+        windows.push(Window {
+            label: entry.get("label")?.as_str()?.to_owned(),
+            pct: entry.get("pct")?.as_f64()?,
+            resets_at_unix: entry.get("resets_at_unix").and_then(Value::as_i64),
+            reset_since: false,
+        });
+    }
+    sort_windows(&mut windows);
+    Some((fetched_at, windows))
+}
+
+fn members_for_workspace(
+    context: &CollectContext,
+    state: &State,
+    workspace_name: &str,
+    workspace: &Workspace,
+) -> Vec<MemberUsage> {
+    let snapshot = cached_snapshot(&workspace.dir);
+    let mut members = Vec::new();
+    for (profile_name, profile) in &state.profiles {
+        if profile.workspace.as_deref() != Some(workspace_name) {
+            continue;
+        }
+        let email = profile
+            .identity
+            .as_ref()
+            .and_then(claude_json::identity_email)
+            .map(str::to_owned);
+        let uuid = identity_account_uuid(profile).map(str::to_owned);
+        members.push(member_usage(
+            context,
+            profile_name,
+            profile,
+            email,
+            uuid.as_deref(),
+            snapshot.as_ref(),
+            false,
+        ));
+    }
+    members
+}
+
+/// Usage rows for one workspace's members (used by `watch`).
+pub fn workspace_member_usage(
+    paths: &AppPaths,
+    state: &State,
+    workspace_name: &str,
+    live: bool,
+    now: i64,
+) -> Vec<MemberUsage> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let context = CollectContext {
+        paths,
+        live,
+        home: home.as_deref(),
+        now,
+    };
+    match state.workspaces.get(workspace_name) {
+        Some(workspace) => members_for_workspace(&context, state, workspace_name, workspace),
+        None => Vec::new(),
     }
 }
 
@@ -338,27 +443,7 @@ pub fn collect(paths: &AppPaths, state: &State, live: bool, now: i64) -> Vec<Gro
     let mut groups = Vec::new();
 
     for (workspace_name, workspace) in &state.workspaces {
-        let snapshot = cached_snapshot(&workspace.dir);
-        let mut members = Vec::new();
-        for (profile_name, profile) in &state.profiles {
-            if profile.workspace.as_deref() != Some(workspace_name.as_str()) {
-                continue;
-            }
-            let email = profile
-                .identity
-                .as_ref()
-                .and_then(claude_json::identity_email)
-                .map(str::to_owned);
-            let uuid = identity_account_uuid(profile).map(str::to_owned);
-            members.push(member_usage(
-                &context,
-                profile_name,
-                profile,
-                email,
-                uuid.as_deref(),
-                snapshot.as_ref(),
-            ));
-        }
+        let members = members_for_workspace(&context, state, workspace_name, workspace);
         groups.push(Group {
             heading: workspace_name.clone(),
             dir: workspace.dir.clone(),
@@ -388,6 +473,7 @@ pub fn collect(paths: &AppPaths, state: &State, live: bool, now: i64) -> Vec<Gro
             email,
             None,
             snapshot.as_ref(),
+            true,
         );
         groups.push(Group {
             heading: profile_name.clone(),

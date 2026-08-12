@@ -44,10 +44,11 @@ impl State {
     fn uses_workspaces(&self) -> bool {
         !self.workspaces.is_empty()
             || !self.mappings.is_empty()
-            || self
-                .profiles
-                .values()
-                .any(|profile| profile.workspace.is_some() || profile.identity.is_some())
+            || self.profiles.values().any(|profile| {
+                profile.workspace.is_some()
+                    || profile.identity.is_some()
+                    || profile.last_usage.is_some()
+            })
     }
 
     /// The target bound to the deepest registered ancestor of `directory`.
@@ -96,6 +97,12 @@ pub struct Workspace {
     /// `claude account use MEMBER` and `claude account watch` change it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected: Option<String>,
+    /// Persisted `claude account watch` settings for this workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<WatchSettings>,
+    /// Unix time of the last automatic rotation (anti-flap cooldown).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_rotated_at: Option<u64>,
 }
 
 impl Workspace {
@@ -105,6 +112,42 @@ impl Workspace {
             created_at: unix_now(),
             external,
             selected: None,
+            watch: None,
+            last_rotated_at: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchSettings {
+    /// Rotate when any gating window reaches this percentage.
+    pub threshold: f64,
+    /// consume-first | best | next-available
+    pub strategy: String,
+    /// Which per-model weekly windows gate: "all", "none", or a
+    /// comma-separated list of model names.
+    pub models: String,
+    /// Poll the usage API with each member's keychain token instead of
+    /// relying on Claude's cached snapshots.
+    #[serde(default)]
+    pub live: bool,
+    /// Base seconds between checks.
+    #[serde(default = "default_watch_interval")]
+    pub interval_secs: u64,
+}
+
+fn default_watch_interval() -> u64 {
+    60
+}
+
+impl Default for WatchSettings {
+    fn default() -> Self {
+        Self {
+            threshold: 90.0,
+            strategy: "consume-first".to_owned(),
+            models: "all".to_owned(),
+            live: false,
+            interval_secs: default_watch_interval(),
         }
     }
 }
@@ -124,6 +167,10 @@ pub struct Profile {
     /// shared `.claude.json` for this member's login. Never contains tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<Value>,
+    /// The last usage windows observed for this login (written by `watch`),
+    /// so an idle workspace member keeps known — decaying — usage numbers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_usage: Option<Value>,
 }
 
 impl Profile {
@@ -149,6 +196,7 @@ impl Profile {
             adopted,
             workspace: None,
             identity: None,
+            last_usage: None,
         }
     }
 }

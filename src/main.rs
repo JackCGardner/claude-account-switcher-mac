@@ -5,6 +5,7 @@ mod paths;
 mod process;
 mod state;
 mod usage;
+mod watch;
 mod workspace;
 
 use std::env;
