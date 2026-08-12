@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::paths::AppPaths;
 
@@ -17,7 +18,7 @@ unsafe extern "C" {
     fn flock(fd: i32, operation: i32) -> i32;
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct State {
     #[serde(default = "state_version")]
     pub version: u32,
@@ -27,6 +28,42 @@ pub struct State {
     pub real_claude: Option<PathBuf>,
     #[serde(default)]
     pub profiles: BTreeMap<String, Profile>,
+    /// Shared workspaces: one directory used by several member profiles, each
+    /// with its own login. Absent entirely in version-1 state files.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub workspaces: BTreeMap<String, Workspace>,
+}
+
+impl State {
+    /// Workspaces are the only feature an older binary would silently drop on
+    /// save, so their presence bumps the persisted version.
+    fn uses_workspaces(&self) -> bool {
+        !self.workspaces.is_empty()
+            || self
+                .profiles
+                .values()
+                .any(|profile| profile.workspace.is_some() || profile.identity.is_some())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Workspace {
+    pub dir: PathBuf,
+    pub created_at: u64,
+    /// The directory pre-existed as a profile's own directory (created with
+    /// `--from-profile`); it is never deleted by workspace removal.
+    #[serde(default)]
+    pub external: bool,
+}
+
+impl Workspace {
+    pub fn new(dir: PathBuf, external: bool) -> Self {
+        Self {
+            dir,
+            created_at: unix_now(),
+            external,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +74,13 @@ pub struct Profile {
     /// managed; 0.1.1 state files deserialize as managed.
     #[serde(default)]
     pub adopted: bool,
+    /// Name of the workspace this profile is a member of, when any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    /// The `oauthAccount`/`userID` identity metadata Claude Code stored in the
+    /// shared `.claude.json` for this member's login. Never contains tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<Value>,
 }
 
 impl Profile {
@@ -48,22 +92,36 @@ impl Profile {
         Self::create(config_dir, true)
     }
 
+    pub fn new_member(config_dir: PathBuf, workspace: String, identity: Option<Value>) -> Self {
+        let mut profile = Self::create(config_dir, false);
+        profile.workspace = Some(workspace);
+        profile.identity = identity;
+        profile
+    }
+
     fn create(config_dir: PathBuf, adopted: bool) -> Self {
-        let created_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
         Self {
             config_dir,
-            created_at,
+            created_at: unix_now(),
             adopted,
+            workspace: None,
+            identity: None,
         }
     }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn state_version() -> u32 {
     1
 }
+
+const MAX_STATE_VERSION: u32 = 2;
 
 pub struct StateLock {
     _file: File,
@@ -101,8 +159,11 @@ pub fn load(paths: &AppPaths) -> Result<State> {
         Ok(file) => {
             let state: State = serde_json::from_reader(file)
                 .with_context(|| format!("failed to parse {}", paths.state_file.display()))?;
-            if state.version != 1 {
-                anyhow::bail!("unsupported state version {}", state.version);
+            if !(1..=MAX_STATE_VERSION).contains(&state.version) {
+                anyhow::bail!(
+                    "unsupported state version {} (created by a newer claude-account?)",
+                    state.version
+                );
             }
             Ok(state)
         }
@@ -118,6 +179,15 @@ pub fn load(paths: &AppPaths) -> Result<State> {
 
 pub fn save(paths: &AppPaths, state: &State) -> Result<()> {
     ensure_private_dir(&paths.config_dir)?;
+    // Persist the lowest version that can represent the state, so an older
+    // binary keeps working until workspaces are actually used and refuses the
+    // file (instead of silently dropping fields) afterwards.
+    let mut snapshot = state.clone();
+    snapshot.version = if snapshot.uses_workspaces() {
+        MAX_STATE_VERSION
+    } else {
+        1
+    };
     let temporary = temporary_state_path(&paths.state_file);
     let result = (|| -> Result<()> {
         let mut file = OpenOptions::new()
@@ -126,7 +196,7 @@ pub fn save(paths: &AppPaths, state: &State) -> Result<()> {
             .mode(0o600)
             .open(&temporary)
             .with_context(|| format!("failed to create {}", temporary.display()))?;
-        serde_json::to_writer_pretty(&mut file, state).context("failed to serialize state")?;
+        serde_json::to_writer_pretty(&mut file, &snapshot).context("failed to serialize state")?;
         file.write_all(b"\n")
             .context("failed to finish state file")?;
         file.sync_all().context("failed to sync state file")?;
@@ -200,5 +270,49 @@ mod tests {
 
         assert_eq!(loaded.active.as_deref(), Some("work"));
         assert!(loaded.profiles.contains_key("work"));
+    }
+
+    #[test]
+    fn workspaces_bump_the_saved_state_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_roots(temp.path().join("config"), temp.path().join("data"));
+        let mut state = State {
+            version: 1,
+            ..State::default()
+        };
+        state
+            .profiles
+            .insert("work".to_owned(), Profile::new(paths.profile_dir("work")));
+
+        let _lock = StateLock::acquire(&paths).unwrap();
+        save(&paths, &state).unwrap();
+        let plain: Value = serde_json::from_slice(&fs::read(&paths.state_file).unwrap()).unwrap();
+        assert_eq!(plain["version"], 1);
+        assert!(plain.get("workspaces").is_none());
+
+        state.workspaces.insert(
+            "shared".to_owned(),
+            Workspace::new(temp.path().join("shared"), true),
+        );
+        save(&paths, &state).unwrap();
+        let versioned: Value =
+            serde_json::from_slice(&fs::read(&paths.state_file).unwrap()).unwrap();
+        assert_eq!(versioned["version"], 2);
+        let loaded = load(&paths).unwrap();
+        assert_eq!(loaded.workspaces["shared"].dir, temp.path().join("shared"));
+        assert!(loaded.workspaces["shared"].external);
+    }
+
+    #[test]
+    fn future_state_versions_are_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_roots(temp.path().join("config"), temp.path().join("data"));
+        ensure_private_dir(&paths.config_dir).unwrap();
+        fs::write(&paths.state_file, r#"{"version":3}"#).unwrap();
+        let error = load(&paths).unwrap_err();
+        assert!(
+            error.to_string().contains("unsupported state version 3"),
+            "{error:#}"
+        );
     }
 }

@@ -1,17 +1,16 @@
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use serde_json::{Map, Value};
 
+use crate::claude_json;
 use crate::paths::AppPaths;
 use crate::process;
 use crate::state::{self, Profile, StateLock};
+use crate::workspace;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -80,6 +79,12 @@ enum AccountCommand {
         #[arg(long)]
         real: Option<PathBuf>,
     },
+    /// Share one directory between several logins: sessions, memories, and
+    /// settings are common, only the subscription differs per member
+    Workspace {
+        #[command(subcommand)]
+        command: workspace::WorkspaceCommand,
+    },
 }
 
 impl AccountCli {
@@ -103,6 +108,7 @@ impl AccountCli {
                 keep_login,
             } => remove(paths, &name, purge, force, keep_login),
             AccountCommand::Install { real } => install(paths, real.as_deref()),
+            AccountCommand::Workspace { command } => command.run(paths),
         }
     }
 }
@@ -140,6 +146,15 @@ fn add(paths: &AppPaths, name: &str, email: Option<&str>, sso: bool, console: bo
     }
 
     let profile_dir = paths.profile_dir(name);
+    if let Ok(metadata) = fs::symlink_metadata(&profile_dir) {
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "{} is a leftover workspace member link; reuse it with `claude account \
+                 workspace join`, or delete the link first",
+                profile_dir.display()
+            );
+        }
+    }
     state::ensure_private_dir(&profile_dir)?;
 
     println!("Logging in profile `{name}` using Claude Code...");
@@ -177,7 +192,7 @@ fn add(paths: &AppPaths, name: &str, email: Option<&str>, sso: bool, console: bo
         );
     }
 
-    complete_claude_onboarding(&profile_dir)?;
+    claude_json::complete_onboarding(&profile_dir)?;
 
     let first_profile;
     {
@@ -205,7 +220,7 @@ fn add(paths: &AppPaths, name: &str, email: Option<&str>, sso: bool, console: bo
     Ok(())
 }
 
-fn adopt(paths: &AppPaths, name: &str, directory: &Path) -> Result<()> {
+pub(crate) fn adopt(paths: &AppPaths, name: &str, directory: &Path) -> Result<()> {
     validate_profile_name(name)?;
     let directory = normalize_adopted_directory(directory)?;
     let metadata = fs::metadata(&directory)
@@ -299,6 +314,15 @@ fn ensure_unregistered(state: &state::State, name: &str, directory: &Path) -> Re
             );
         }
     }
+    for (existing, workspace) in &state.workspaces {
+        if workspace.dir == directory {
+            bail!(
+                "{} is the storage of workspace `{existing}`; add a login to it with \
+                 `claude account workspace join {existing} NAME`",
+                directory.display()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -333,62 +357,35 @@ fn normalize_adopted_directory(directory: &Path) -> Result<PathBuf> {
     Ok(normalized)
 }
 
-fn complete_claude_onboarding(profile_dir: &Path) -> Result<()> {
-    let config_path = profile_dir.join(".claude.json");
-    let mut config = match fs::read(&config_path) {
-        Ok(contents) => serde_json::from_slice::<Value>(&contents)
-            .with_context(|| format!("failed to parse {}", config_path.display()))?,
-        Err(error) if error.kind() == ErrorKind::NotFound => Value::Object(Map::new()),
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to read {}", config_path.display()));
-        }
-    };
-    let config = config
-        .as_object_mut()
-        .with_context(|| format!("{} must contain a JSON object", config_path.display()))?;
-    config.insert("hasCompletedOnboarding".to_owned(), Value::Bool(true));
-
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let temporary = profile_dir.join(format!(".claude.json.tmp.{}.{}", std::process::id(), nonce));
-    let result = (|| -> Result<()> {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(&temporary)
-            .with_context(|| format!("failed to create {}", temporary.display()))?;
-        serde_json::to_writer_pretty(&mut file, &config)
-            .context("failed to serialize Claude onboarding state")?;
-        file.write_all(b"\n")
-            .context("failed to finish Claude onboarding state")?;
-        file.sync_all()
-            .context("failed to sync Claude onboarding state")?;
-        fs::rename(&temporary, &config_path)
-            .with_context(|| format!("failed to update {}", config_path.display()))?;
-        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to protect {}", config_path.display()))?;
-        Ok(())
-    })();
-
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
-}
-
-fn use_profile(paths: &AppPaths, name: &str) -> Result<()> {
+pub(crate) fn use_profile(paths: &AppPaths, name: &str) -> Result<()> {
     validate_profile_name(name)?;
     let _lock = StateLock::acquire(paths)?;
     let mut state = state::load(paths)?;
     if !state.profiles.contains_key(name) {
         bail!("profile `{name}` does not exist");
     }
+    if state.active.as_deref() != Some(name) {
+        // Before switching away, save the identity currently in the shared
+        // .claude.json for the member it belongs to.
+        workspace::refresh_active_member_identity(&mut state);
+    }
     state.active = Some(name.to_owned());
+    workspace::write_active_member_identity(&state);
     state::save(paths, &state)?;
     println!("Now using `{name}` for new Claude processes.");
+    let profile = &state.profiles[name];
+    if let Some(workspace_name) = &profile.workspace {
+        println!(
+            "(member of workspace `{workspace_name}`: shared sessions and memories, separate \
+             login)"
+        );
+        if profile.identity.is_none() {
+            println!(
+                "note: no recorded sign-in identity for `{name}` yet; if Claude shows another \
+                 account's email, run `claude auth login` once."
+            );
+        }
+    }
     Ok(())
 }
 
@@ -407,6 +404,9 @@ fn list(paths: &AppPaths, with_status: bool) -> Result<()> {
         let mut line = format!("{marker} {name}");
         if profile.adopted {
             line.push_str(&format!("  ({})", profile.config_dir.display()));
+        }
+        if let Some(workspace_name) = &profile.workspace {
+            line.push_str(&format!("  [workspace {workspace_name}]"));
         }
         if with_status {
             line.push_str(&format!("  {}", profile_status(&state, profile)));
@@ -444,9 +444,15 @@ fn current(paths: &AppPaths) -> Result<()> {
     }
 }
 
-fn remove(paths: &AppPaths, name: &str, purge: bool, force: bool, keep_login: bool) -> Result<()> {
+pub(crate) fn remove(
+    paths: &AppPaths,
+    name: &str,
+    purge: bool,
+    force: bool,
+    keep_login: bool,
+) -> Result<()> {
     validate_profile_name(name)?;
-    let (profile, real_claude, is_active, adopted) = {
+    let (profile, real_claude, is_active, member_workspace) = {
         let _lock = StateLock::acquire(paths)?;
         let state = state::load(paths)?;
         let profile = state
@@ -454,8 +460,20 @@ fn remove(paths: &AppPaths, name: &str, purge: bool, force: bool, keep_login: bo
             .get(name)
             .cloned()
             .with_context(|| format!("profile `{name}` does not exist"))?;
-        let adopted = profile.adopted;
-        if purge && adopted {
+        let member_workspace = profile
+            .workspace
+            .as_ref()
+            .and_then(|workspace_name| state.workspaces.get(workspace_name))
+            .cloned();
+        if purge && profile.workspace.is_some() {
+            bail!(
+                "`{name}` is a workspace member; members share the workspace directory, so \
+                 removing one never deletes shared data. Remove it without --purge (this only \
+                 logs out its login), or remove the whole workspace with `claude account \
+                 workspace remove`"
+            );
+        }
+        if purge && profile.adopted {
             bail!(
                 "refusing to purge adopted directory {}; remove the profile without --purge and \
                  delete the directory yourself if that is what you want",
@@ -468,8 +486,17 @@ fn remove(paths: &AppPaths, name: &str, purge: bool, force: bool, keep_login: bo
                 "`{name}` is active; switch profiles first, or pass --force to leave no active profile"
             );
         }
-        (profile, state.real_claude.clone(), is_active, adopted)
+        (
+            profile,
+            state.real_claude.clone(),
+            is_active,
+            member_workspace,
+        )
     };
+    let adopted = profile.adopted;
+    let is_founding_member = member_workspace
+        .as_ref()
+        .is_some_and(|workspace| workspace.dir == profile.config_dir);
 
     if keep_login || adopted {
         if adopted && !keep_login {
@@ -512,6 +539,26 @@ fn remove(paths: &AppPaths, name: &str, purge: bool, force: bool, keep_login: bo
         state::save(paths, &state)?;
     }
 
+    if member_workspace.is_some() {
+        if !is_founding_member {
+            if keep_login {
+                println!(
+                    "Kept the member link {}; joining the workspace again with the same name \
+                     will reuse its login.",
+                    profile.config_dir.display()
+                );
+            } else if let Ok(metadata) = fs::symlink_metadata(&profile.config_dir) {
+                if metadata.file_type().is_symlink() {
+                    let _ = fs::remove_file(&profile.config_dir);
+                }
+            }
+        }
+        // Logging this member out may have cleared the shared identity
+        // fields; restore the ones of the member that is still active.
+        let state = state::load(paths)?;
+        workspace::write_active_member_identity(&state);
+    }
+
     if purge {
         let expected = paths.profile_dir(name);
         if profile.config_dir != expected {
@@ -529,6 +576,11 @@ fn remove(paths: &AppPaths, name: &str, purge: bool, force: bool, keep_login: bo
         fs::remove_dir_all(&expected)
             .with_context(|| format!("failed to purge {}", expected.display()))?;
         println!("Removed `{name}` and permanently deleted its local data.");
+    } else if let Some(workspace) = &member_workspace {
+        println!(
+            "Removed member `{name}`. The workspace directory {} was not touched.",
+            workspace.dir.display()
+        );
     } else if adopted {
         println!(
             "Removed `{name}`. The adopted directory {} was not touched.",
@@ -649,9 +701,15 @@ fn print_path_instructions(shim_dir: &Path) {
     }
 }
 
-fn validate_profile_name(name: &str) -> Result<()> {
+pub(crate) fn validate_profile_name(name: &str) -> Result<()> {
+    validate_name("profile", name)
+}
+
+pub(crate) fn validate_name(kind: &str, name: &str) -> Result<()> {
     let mut characters = name.chars();
-    let first = characters.next().context("profile name cannot be empty")?;
+    let first = characters
+        .next()
+        .with_context(|| format!("{kind} name cannot be empty"))?;
     if !first.is_ascii_alphanumeric()
         || !characters.all(|character| {
             character.is_ascii_alphanumeric() || character == '-' || character == '_'
@@ -659,7 +717,7 @@ fn validate_profile_name(name: &str) -> Result<()> {
         || name.len() > 32
     {
         bail!(
-            "invalid profile name `{name}`; use 1-32 letters, numbers, hyphens, or underscores, \
+            "invalid {kind} name `{name}`; use 1-32 letters, numbers, hyphens, or underscores, \
              starting with a letter or number"
         );
     }
@@ -669,6 +727,7 @@ fn validate_profile_name(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     fn install_fake_claude(path: &Path, script: &str) {
         fs::write(path, script).unwrap();
@@ -759,29 +818,6 @@ mod tests {
         .unwrap();
         assert_eq!(claude_config["hasCompletedOnboarding"], true);
         assert_eq!(state::load(&paths).unwrap().active.as_deref(), Some("work"));
-    }
-
-    #[test]
-    fn onboarding_update_preserves_existing_claude_state() {
-        let temp = tempfile::tempdir().unwrap();
-        let profile = temp.path().join("profile");
-        state::ensure_private_dir(&profile).unwrap();
-        let config_path = profile.join(".claude.json");
-        fs::write(
-            &config_path,
-            r#"{"existing":{"setting":"preserved"},"hasCompletedOnboarding":false}"#,
-        )
-        .unwrap();
-
-        complete_claude_onboarding(&profile).unwrap();
-
-        let updated: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
-        assert_eq!(updated["existing"]["setting"], "preserved");
-        assert_eq!(updated["hasCompletedOnboarding"], true);
-        assert_eq!(
-            fs::metadata(config_path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
     }
 
     #[test]

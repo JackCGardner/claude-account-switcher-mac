@@ -10,6 +10,7 @@ pub struct AppPaths {
     pub state_file: PathBuf,
     pub lock_file: PathBuf,
     pub profiles_dir: PathBuf,
+    pub workspaces_dir: PathBuf,
     pub shim_dir: PathBuf,
     pub shim: PathBuf,
     pub installed_executable: PathBuf,
@@ -48,6 +49,7 @@ impl AppPaths {
             state_file: config_dir.join("state.json"),
             lock_file: config_dir.join("state.lock"),
             profiles_dir: data_dir.join("profiles"),
+            workspaces_dir: data_dir.join("workspaces"),
             shim: shim_dir.join("claude"),
             installed_executable: data_dir.join("libexec/claude-account"),
             config_dir,
@@ -58,6 +60,10 @@ impl AppPaths {
 
     pub fn profile_dir(&self, name: &str) -> PathBuf {
         self.profiles_dir.join(name)
+    }
+
+    pub fn workspace_dir(&self, name: &str) -> PathBuf {
+        self.workspaces_dir.join(name)
     }
 }
 

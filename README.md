@@ -12,6 +12,8 @@ commands to the official Claude executable.
 claude account add work
 claude account add personal
 claude account adopt movo ~/.claude-work
+claude account workspace create work --from-profile movo
+claude account workspace join work movo-2
 claude account use work
 claude account list
 claude account current
@@ -33,10 +35,11 @@ refresh. `claude-account` never reads or copies credential contents.
 
 - Linux or macOS
 - A working Claude Code installation. On macOS this must be a recent build
-  (verified with 2.1.220): older builds kept a single shared keychain item for
-  every configuration directory, which makes per-profile isolation impossible.
-  `claude account add` checks for this and refuses to continue on affected
-  builds — see [How credentials are isolated](#how-credentials-are-isolated).
+  (verified with 2.1.220 and 2.1.228): older builds kept a single shared
+  keychain item for every configuration directory, which makes per-profile
+  isolation impossible. `claude account add` checks for this and refuses to
+  continue on affected builds — see
+  [How credentials are isolated](#how-credentials-are-isolated).
 - Rust 1.85 or later to build from source
 
 ## Install a release
@@ -44,20 +47,20 @@ refresh. `claude-account` never reads or copies credential contents.
 Download the archive for your platform and its `.sha256` file from the
 [latest release][releases]:
 
-- `claude-account-v0.2.0-x86_64-unknown-linux-gnu.tar.gz` — Linux
-- `claude-account-v0.2.0-aarch64-apple-darwin.tar.gz` — macOS on Apple Silicon
-- `claude-account-v0.2.0-x86_64-apple-darwin.tar.gz` — macOS on Intel
+- `claude-account-v0.3.0-x86_64-unknown-linux-gnu.tar.gz` — Linux
+- `claude-account-v0.3.0-aarch64-apple-darwin.tar.gz` — macOS on Apple Silicon
+- `claude-account-v0.3.0-x86_64-apple-darwin.tar.gz` — macOS on Intel
 
 Then verify and install it:
 
 ```bash
 # Linux
-sha256sum --check claude-account-v0.2.0-x86_64-unknown-linux-gnu.tar.gz.sha256
-tar -xzf claude-account-v0.2.0-x86_64-unknown-linux-gnu.tar.gz
+sha256sum --check claude-account-v0.3.0-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf claude-account-v0.3.0-x86_64-unknown-linux-gnu.tar.gz
 
 # macOS (Apple Silicon)
-shasum -a 256 --check claude-account-v0.2.0-aarch64-apple-darwin.tar.gz.sha256
-tar -xzf claude-account-v0.2.0-aarch64-apple-darwin.tar.gz
+shasum -a 256 --check claude-account-v0.3.0-aarch64-apple-darwin.tar.gz.sha256
+tar -xzf claude-account-v0.3.0-aarch64-apple-darwin.tar.gz
 
 ./claude-account install
 ```
@@ -137,6 +140,51 @@ Adopting `~/.claude` (Claude's default directory) is special: the profile runs
 Claude with `CLAUDE_CONFIG_DIR` *unset*, because Claude Code derives its
 credential-storage key from the variable and an explicit `~/.claude` would
 select different credentials than a plain `claude` command.
+
+### Share one directory between several subscriptions (workspaces)
+
+If you have two subscriptions but want them to feel like one account — same
+sessions, transcripts, memories, settings, and history, with only the login
+differing — put them in a shared workspace:
+
+```bash
+claude account adopt movo ~/.claude-work           # existing dir, first login
+claude account workspace create work --from-profile movo
+claude account workspace join work movo-2          # log in the 2nd subscription
+claude account use movo-2                          # switch subscription, keep everything
+claude account workspace list
+```
+
+`workspace create --from-profile` uses the profile's directory as the shared
+storage, in place and without copying; that profile keeps its login and
+becomes the first member. `workspace join` adds a member: it creates a
+private symlink to the workspace directory, runs Claude Code's official login
+through it, and registers the member as a normal profile. Because recent
+Claude Code builds derive their credential-storage key from the literal
+`CLAUDE_CONFIG_DIR` string, each member link selects its own keychain login
+while every file Claude reads or writes lands in the one shared directory.
+Switching members with `claude account use` therefore changes nothing except
+which subscription pays for the tokens; resumed sessions carry on seamlessly.
+
+`account use` also keeps the account identity that Claude Code records in the
+shared `.claude.json` (`oauthAccount`/`userID`) in step with the active
+member, so `/status` and friends show the account whose login is actually in
+use. Running sessions started under the other member keep working; they were
+started with their own credentials.
+
+Like `add`, joining is protected by empirical probes: it aborts when a
+brand-new link to the workspace can already see the members' logins. That is
+always the case on Linux, where credentials live in a plaintext file inside
+the (shared) directory — workspaces are effectively a macOS feature until
+Linux builds gain per-directory external credential storage. Claude's default
+`~/.claude` directory cannot become a workspace either, because Claude Code
+keeps its top-level state at `~/.claude.json` when run without
+`CLAUDE_CONFIG_DIR`, which members would not share.
+
+`account remove MEMBER` logs out only that member's login and deletes its
+link; the shared directory is never touched. `account workspace remove NAME`
+unregisters the workspace once its linked members are gone and detaches the
+founding profile back into a standalone one.
 
 ### Switch accounts
 
@@ -241,6 +289,7 @@ By default:
 ```text
 ~/.config/claude-account/state.json
 ~/.local/share/claude-account/profiles/<name>/
+~/.local/share/claude-account/workspaces/<name>/
 ~/.local/share/claude-account/bin/claude
 ~/.local/share/claude-account/libexec/claude-account
 ```
@@ -248,10 +297,15 @@ By default:
 The same layout is used on Linux and macOS, and the standard
 `XDG_CONFIG_HOME` and `XDG_DATA_HOME` variables are respected on both.
 `CLAUDE_ACCOUNT_HOME` can place all application data under one absolute
-directory, which is especially useful for tests.
+directory, which is especially useful for tests. Workspace members appear
+under `profiles/<name>` as symlinks to their workspace directory; the member's
+login is keyed to the symlink's own path, so moving or renaming the link
+orphans that login.
 
-The state file contains profile names, directory paths, and the real Claude
-executable path. It never contains access or refresh tokens.
+The state file contains profile names, directory paths, the real Claude
+executable path, and — for workspace members — the account-identity metadata
+Claude Code shows for the login (email and account ids). It never contains
+access or refresh tokens.
 
 ## Authentication environment variables
 

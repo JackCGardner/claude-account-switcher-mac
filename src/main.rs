@@ -1,7 +1,9 @@
 mod account;
+mod claude_json;
 mod paths;
 mod process;
 mod state;
+mod workspace;
 
 use std::env;
 use std::ffi::OsString;

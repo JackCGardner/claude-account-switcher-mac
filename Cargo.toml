@@ -1,6 +1,6 @@
 [package]
 name = "claude-account"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Profile switcher for multiple Claude Code accounts on Linux and macOS"

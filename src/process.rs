@@ -111,11 +111,26 @@ fn auth_status_from(mut command: Command, quiet: bool) -> Result<AuthStatus> {
     }
 }
 
+/// Ask whether Claude sees a *stored* login for the given configuration
+/// directory. Environment-token auth never influences the answer — even when
+/// the user opted into CLAUDE_ACCOUNT_PRESERVE_AUTH_ENV=1 — because the
+/// question is always about credential storage. `None` means the probe was
+/// inconclusive (for example, a Claude build without `auth status`).
+pub fn dir_sees_login(real_claude: &Path, config_dir: &Path) -> Option<bool> {
+    let mut command = managed_command(real_claude, config_dir);
+    for variable in AUTH_ENVIRONMENT {
+        command.env_remove(variable);
+    }
+    match auth_status_from(command, true) {
+        Ok(status) => Some(status.logged_in),
+        Err(_) => None,
+    }
+}
+
 /// Probe whether a brand-new, empty configuration directory already sees an
 /// existing login. With per-profile credential storage this is always false;
 /// `Some(true)` means this Claude Code build shares credentials across
-/// configuration directories, so profiles cannot be isolated. `None` means the
-/// probe was inconclusive (for example, a Claude build without `auth status`).
+/// configuration directories, so profiles cannot be isolated.
 pub fn fresh_dir_sees_login(real_claude: &Path, paths: &AppPaths) -> Option<bool> {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -128,19 +143,9 @@ pub fn fresh_dir_sees_login(real_claude: &Path, paths: &AppPaths) -> Option<bool
     if state::ensure_private_dir(&probe_dir).is_err() {
         return None;
     }
-    // The probe asks whether *stored* credentials leak into a fresh
-    // directory, so environment-token auth must never influence it — even
-    // when the user opted into CLAUDE_ACCOUNT_PRESERVE_AUTH_ENV=1.
-    let mut command = managed_command(real_claude, &probe_dir);
-    for variable in AUTH_ENVIRONMENT {
-        command.env_remove(variable);
-    }
-    let status = auth_status_from(command, true);
+    let result = dir_sees_login(real_claude, &probe_dir);
     let _ = fs::remove_dir_all(&probe_dir);
-    match status {
-        Ok(status) => Some(status.logged_in),
-        Err(_) => None,
-    }
+    result
 }
 
 pub fn resolve_real_claude(
