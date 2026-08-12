@@ -97,7 +97,7 @@ impl AccountCli {
                 console,
             } => add(paths, &name, email.as_deref(), sso, console),
             AccountCommand::Adopt { name, directory } => adopt(paths, &name, &directory),
-            AccountCommand::Use { name } => use_profile(paths, &name),
+            AccountCommand::Use { name } => use_target(paths, &name),
             AccountCommand::List { status } => list(paths, status),
             AccountCommand::Current => current(paths),
             AccountCommand::Remove {
@@ -121,6 +121,12 @@ fn add(paths: &AppPaths, name: &str, email: Option<&str>, sso: bool, console: bo
         let state = state::load(paths)?;
         if state.profiles.contains_key(name) {
             bail!("profile `{name}` already exists");
+        }
+        if state.workspaces.contains_key(name) {
+            bail!(
+                "a workspace named `{name}` already exists; workspace and profile names share \
+                 one namespace"
+            );
         }
         state
     };
@@ -306,6 +312,9 @@ fn ensure_unregistered(state: &state::State, name: &str, directory: &Path) -> Re
     if state.profiles.contains_key(name) {
         bail!("profile `{name}` already exists");
     }
+    if state.workspaces.contains_key(name) {
+        bail!("a workspace named `{name}` already exists; workspace and profile names share one namespace");
+    }
     for (existing, profile) in &state.profiles {
         if profile.config_dir == directory {
             bail!(
@@ -357,35 +366,68 @@ fn normalize_adopted_directory(directory: &Path) -> Result<PathBuf> {
     Ok(normalized)
 }
 
-pub(crate) fn use_profile(paths: &AppPaths, name: &str) -> Result<()> {
+/// `use NAME` where NAME is a workspace (target it, keeping or inferring its
+/// selected member), a workspace member (select it and target its workspace),
+/// or a standalone profile (target it directly).
+pub(crate) fn use_target(paths: &AppPaths, name: &str) -> Result<()> {
     validate_profile_name(name)?;
     let _lock = StateLock::acquire(paths)?;
     let mut state = state::load(paths)?;
-    if !state.profiles.contains_key(name) {
-        bail!("profile `{name}` does not exist");
-    }
-    if state.active.as_deref() != Some(name) {
-        // Before switching away, save the identity currently in the shared
-        // .claude.json for the member it belongs to.
-        workspace::refresh_active_member_identity(&mut state);
-    }
-    state.active = Some(name.to_owned());
-    workspace::write_active_member_identity(&state);
-    state::save(paths, &state)?;
-    println!("Now using `{name}` for new Claude processes.");
-    let profile = &state.profiles[name];
-    if let Some(workspace_name) = &profile.workspace {
+
+    if state.workspaces.contains_key(name) {
+        let members: Vec<String> = state
+            .profiles
+            .iter()
+            .filter(|(_, profile)| profile.workspace.as_deref() == Some(name))
+            .map(|(member, _)| member.clone())
+            .collect();
+        if members.is_empty() {
+            bail!(
+                "workspace `{name}` has no members yet; add one with `claude account workspace \
+                 join {name} PROFILE`"
+            );
+        }
+        let selected = match state.workspaces[name].selected.clone() {
+            Some(selected) if state.profiles.contains_key(&selected) => selected,
+            _ if members.len() == 1 => members[0].clone(),
+            _ => bail!(
+                "workspace `{name}` has no selected member; pick one with `claude account use \
+                 MEMBER` (members: {})",
+                members.join(", ")
+            ),
+        };
+        workspace::select_member(&mut state, name, &selected);
+        state.active = Some(name.to_owned());
+        state::save(paths, &state)?;
         println!(
-            "(member of workspace `{workspace_name}`: shared sessions and memories, separate \
-             login)"
+            "Now targeting workspace `{name}` (member `{selected}`) for new Claude processes."
         );
-        if profile.identity.is_none() {
+        return Ok(());
+    }
+
+    let Some(profile) = state.profiles.get(name).cloned() else {
+        bail!("`{name}` is not a registered profile or workspace");
+    };
+    if let Some(workspace_name) = profile.workspace.clone() {
+        workspace::select_member(&mut state, &workspace_name, name);
+        state.active = Some(workspace_name.clone());
+        state::save(paths, &state)?;
+        println!(
+            "Selected `{name}` in workspace `{workspace_name}`; new Claude processes use it \
+             (shared sessions and memories, separate login)."
+        );
+        if state.profiles[name].identity.is_none() {
             println!(
                 "note: no recorded sign-in identity for `{name}` yet; if Claude shows another \
                  account's email, run `claude auth login` once."
             );
         }
+        return Ok(());
     }
+
+    state.active = Some(name.to_owned());
+    state::save(paths, &state)?;
+    println!("Now using `{name}` for new Claude processes.");
     Ok(())
 }
 
@@ -395,8 +437,13 @@ fn list(paths: &AppPaths, with_status: bool) -> Result<()> {
         println!("No profiles. Add one with `claude account add NAME`.");
         return Ok(());
     }
+    let default_profile = state
+        .active
+        .as_deref()
+        .and_then(|target| state.resolve_target(target).ok())
+        .map(|(profile_name, _)| profile_name);
     for (name, profile) in &state.profiles {
-        let marker = if state.active.as_deref() == Some(name) {
+        let marker = if default_profile.as_deref() == Some(name.as_str()) {
             "*"
         } else {
             " "
@@ -435,13 +482,10 @@ fn profile_status(state: &state::State, profile: &Profile) -> String {
 
 fn current(paths: &AppPaths) -> Result<()> {
     let state = state::load(paths)?;
-    match state.active {
-        Some(name) => {
-            println!("{name}");
-            Ok(())
-        }
-        None => bail!("no active profile"),
-    }
+    let target = state.active.as_deref().context("no active profile")?;
+    let (profile_name, _) = state.resolve_target(target)?;
+    println!("{profile_name}");
+    Ok(())
 }
 
 pub(crate) fn remove(
@@ -536,10 +580,39 @@ pub(crate) fn remove(
         if is_active && state.active.as_deref() == Some(name) {
             state.active = None;
         }
+        if let Some(workspace_name) = &profile.workspace {
+            let remaining: Vec<String> = state
+                .profiles
+                .iter()
+                .filter(|(_, entry)| entry.workspace.as_deref() == Some(workspace_name.as_str()))
+                .map(|(member, _)| member.clone())
+                .collect();
+            if let Some(entry) = state.workspaces.get_mut(workspace_name) {
+                if entry.selected.as_deref() == Some(name) {
+                    if remaining.len() == 1 {
+                        entry.selected = Some(remaining[0].clone());
+                        println!(
+                            "Workspace `{workspace_name}` now selects its remaining member \
+                             `{}`.",
+                            remaining[0]
+                        );
+                    } else {
+                        entry.selected = None;
+                        if !remaining.is_empty() {
+                            println!(
+                                "Workspace `{workspace_name}` has no selected member; pick one \
+                                 with `claude account use MEMBER` (members: {}).",
+                                remaining.join(", ")
+                            );
+                        }
+                    }
+                }
+            }
+        }
         state::save(paths, &state)?;
     }
 
-    if member_workspace.is_some() {
+    if let Some(workspace_name) = &profile.workspace {
         if !is_founding_member {
             if keep_login {
                 println!(
@@ -554,9 +627,9 @@ pub(crate) fn remove(
             }
         }
         // Logging this member out may have cleared the shared identity
-        // fields; restore the ones of the member that is still active.
+        // fields; restore the selected member's.
         let state = state::load(paths)?;
-        workspace::write_active_member_identity(&state);
+        workspace::write_selected_identity(&state, workspace_name);
     }
 
     if purge {

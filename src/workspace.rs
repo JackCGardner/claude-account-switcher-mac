@@ -97,6 +97,9 @@ fn create(
     if state.workspaces.contains_key(name) {
         bail!("workspace `{name}` already exists");
     }
+    if state.profiles.contains_key(name) {
+        bail!("a profile named `{name}` already exists; workspace and profile names share one namespace");
+    }
 
     match from_profile {
         Some(profile_name) => {
@@ -134,16 +137,25 @@ fn create(
             if identity.is_some() {
                 entry.identity = identity;
             }
-            state
-                .workspaces
-                .insert(name.to_owned(), Workspace::new(directory.clone(), true));
+            let mut workspace = Workspace::new(directory.clone(), true);
+            workspace.selected = Some(profile_name.to_owned());
+            state.workspaces.insert(name.to_owned(), workspace);
+            let retargeted = state.active.as_deref() == Some(profile_name);
+            if retargeted {
+                // Launches that followed the profile now follow the workspace,
+                // so future rotations apply without another `use`.
+                state.active = Some(name.to_owned());
+            }
             state::save(paths, &state)?;
 
             println!("Created workspace `{name}` around {}.", directory.display());
             println!(
-                "`{profile_name}` is its first member. Add another subscription with \
-                 `claude account workspace join {name} PROFILE`."
+                "`{profile_name}` is its first member and selected. Add another subscription \
+                 with `claude account workspace join {name} PROFILE`."
             );
+            if retargeted {
+                println!("New Claude processes now target workspace `{name}`.");
+            }
         }
         None => {
             let directory = paths.workspace_dir(name);
@@ -189,6 +201,9 @@ fn join(
             })?;
         if state.profiles.contains_key(name) {
             bail!("profile `{name}` already exists");
+        }
+        if state.workspaces.contains_key(name) {
+            bail!("a workspace named `{name}` already exists; workspace and profile names share one namespace");
         }
         let member_dirs: Vec<PathBuf> = state
             .profiles
@@ -252,11 +267,11 @@ fn join(
 
     // The login below overwrites the account identity in the shared
     // .claude.json, so record the current identity for the member it belongs
-    // to (the active one) first.
+    // to (the selected one) first.
     {
         let _lock = StateLock::acquire(paths)?;
         let mut state = state::load(paths)?;
-        refresh_active_member_identity(&mut state);
+        capture_selected_identity(&mut state, workspace_name);
         state::save(paths, &state)?;
     }
 
@@ -386,13 +401,20 @@ fn join(
                 captured_identity,
             ),
         );
-        if first_profile {
-            state.active = Some(name.to_owned());
-        } else {
-            // The login rewrote the shared identity; put the active member's
-            // own identity back so running sessions stay coherent.
-            write_active_member_identity(&state);
+        let entry = state
+            .workspaces
+            .get_mut(workspace_name)
+            .expect("workspace existence checked above");
+        if entry.selected.is_none() {
+            entry.selected = Some(name.to_owned());
         }
+        if first_profile {
+            state.active = Some(workspace_name.to_owned());
+        }
+        // The login rewrote the shared identity; put the selected member's
+        // own identity back so launches stay coherent. (When the new member
+        // became the selection, this simply re-asserts its own identity.)
+        write_selected_identity(&state, workspace_name);
         state::save(paths, &state)?;
     }
 
@@ -418,14 +440,19 @@ fn list(paths: &AppPaths) -> Result<()> {
         return Ok(());
     }
     for (name, workspace) in &state.workspaces {
-        println!("{name}  ({})", workspace.dir.display());
+        let default_tag = if state.active.as_deref() == Some(name.as_str()) {
+            "  [default target]"
+        } else {
+            ""
+        };
+        println!("{name}  ({}){default_tag}", workspace.dir.display());
         let mut any_member = false;
         for (profile_name, profile) in &state.profiles {
             if profile.workspace.as_deref() != Some(name.as_str()) {
                 continue;
             }
             any_member = true;
-            let marker = if state.active.as_deref() == Some(profile_name) {
+            let marker = if workspace.selected.as_deref() == Some(profile_name) {
                 "*"
             } else {
                 " "
@@ -503,6 +530,11 @@ fn remove(paths: &AppPaths, name: &str, purge: bool) -> Result<()> {
         profile.identity = None;
     }
     state.workspaces.remove(name);
+    if state.active.as_deref() == Some(name) {
+        // The default target dissolves with the workspace; fall back to the
+        // detached founding profile when there is one.
+        state.active = founding.clone();
+    }
     state::save(paths, &state)?;
 
     if let Some(founding_name) = &founding {
@@ -554,30 +586,27 @@ fn symlink_sees_workspace_login(
     result
 }
 
-/// Re-read the shared `.claude.json` identity and store it on the currently
-/// active profile when that profile is a workspace member. The file always
-/// carries the identity of whichever member logged in last — normally the
-/// active one — so this picks up manual `claude auth login` runs too.
-pub fn refresh_active_member_identity(state: &mut state::State) {
-    let Some(active) = state.active.clone() else {
+/// Record the identity currently in the workspace's shared `.claude.json` on
+/// the workspace's selected member. The file carries the identity of
+/// whichever member logged in last — normally the selected one — so this also
+/// picks up manual `claude auth login` runs.
+pub fn capture_selected_identity(state: &mut state::State, workspace_name: &str) {
+    let Some(workspace) = state.workspaces.get(workspace_name) else {
         return;
     };
-    let Some(profile) = state.profiles.get(&active) else {
-        return;
-    };
-    let Some(workspace_name) = profile.workspace.clone() else {
-        return;
-    };
-    let Some(workspace) = state.workspaces.get(&workspace_name) else {
+    let Some(selected) = workspace.selected.clone() else {
         return;
     };
     let workspace_dir = workspace.dir.clone();
+    if !state.profiles.contains_key(&selected) {
+        return;
+    }
     match claude_json::read_identity(&workspace_dir) {
         Ok(Some(identity)) => {
             state
                 .profiles
-                .get_mut(&active)
-                .expect("active profile fetched above")
+                .get_mut(&selected)
+                .expect("membership checked above")
                 .identity = Some(identity);
         }
         Ok(None) => {}
@@ -588,21 +617,18 @@ pub fn refresh_active_member_identity(state: &mut state::State) {
     }
 }
 
-/// Write the active member's recorded identity into its workspace's shared
-/// `.claude.json`, so Claude displays the account that matches the login the
-/// member actually uses. Does nothing when the active profile is not a
-/// workspace member or has no recorded identity.
-pub fn write_active_member_identity(state: &state::State) {
-    let Some(active) = state.active.as_deref() else {
-        return;
-    };
-    let Some(profile) = state.profiles.get(active) else {
-        return;
-    };
-    let Some(workspace_name) = profile.workspace.as_deref() else {
-        return;
-    };
+/// Write the selected member's recorded identity into the workspace's shared
+/// `.claude.json`, so Claude displays the account that matches the login in
+/// use. Does nothing when the workspace has no selection or no recorded
+/// identity for it.
+pub fn write_selected_identity(state: &state::State, workspace_name: &str) {
     let Some(workspace) = state.workspaces.get(workspace_name) else {
+        return;
+    };
+    let Some(selected) = workspace.selected.as_deref() else {
+        return;
+    };
+    let Some(profile) = state.profiles.get(selected) else {
         return;
     };
     let Some(identity) = profile.identity.as_ref() else {
@@ -610,10 +636,21 @@ pub fn write_active_member_identity(state: &state::State) {
     };
     if let Err(error) = claude_json::write_identity(&workspace.dir, identity) {
         eprintln!(
-            "warning: could not restore `{active}`'s account identity in {}: {error:#}",
+            "warning: could not restore `{selected}`'s account identity in {}: {error:#}",
             workspace.dir.display()
         );
     }
+}
+
+/// Make `member` the workspace's selected member: save the previous member's
+/// identity from the shared file, flip the selection, and write the new
+/// member's identity in.
+pub fn select_member(state: &mut state::State, workspace_name: &str, member: &str) {
+    capture_selected_identity(state, workspace_name);
+    if let Some(workspace) = state.workspaces.get_mut(workspace_name) {
+        workspace.selected = Some(member.to_owned());
+    }
+    write_selected_identity(state, workspace_name);
 }
 
 #[cfg(test)]
@@ -800,14 +837,22 @@ mod tests {
         assert_eq!(cred_count(&fixture), 2, "each member holds its own login");
 
         let state = state::load(&fixture.paths).unwrap();
-        assert_eq!(state.active.as_deref(), Some("founder"));
+        // Creating the workspace retargeted launches from the founding
+        // profile to the workspace; joining keeps the founder selected.
+        assert_eq!(state.active.as_deref(), Some("work"));
+        assert_eq!(
+            state.workspaces["work"].selected.as_deref(),
+            Some("founder")
+        );
+        let (resolved, _) = state.resolve_target("work").unwrap();
+        assert_eq!(resolved, "founder");
         assert_eq!(state.profiles["second"].workspace.as_deref(), Some("work"));
         assert_eq!(
             claude_json::identity_email(state.profiles["second"].identity.as_ref().unwrap()),
             Some("second@example.com")
         );
 
-        // The active member's identity was restored after the new login.
+        // The selected member's identity was restored after the new login.
         assert_eq!(
             shared_claude_json(&fixture)["oauthAccount"]["emailAddress"],
             "founder@example.com"
@@ -821,7 +866,7 @@ mod tests {
         fs::write(fixture.control.join("next-email"), "second@example.com").unwrap();
         join(&fixture.paths, "work", "second", None, false, false).unwrap();
 
-        account::use_profile(&fixture.paths, "second").unwrap();
+        account::use_target(&fixture.paths, "second").unwrap();
         assert_eq!(
             shared_claude_json(&fixture)["oauthAccount"]["emailAddress"],
             "second@example.com"
@@ -830,8 +875,43 @@ mod tests {
             shared_claude_json(&fixture)["userID"],
             "uid-second@example.com"
         );
+        let state = state::load(&fixture.paths).unwrap();
+        assert_eq!(state.active.as_deref(), Some("work"));
+        assert_eq!(state.workspaces["work"].selected.as_deref(), Some("second"));
 
-        account::use_profile(&fixture.paths, "founder").unwrap();
+        account::use_target(&fixture.paths, "founder").unwrap();
+        assert_eq!(
+            shared_claude_json(&fixture)["oauthAccount"]["emailAddress"],
+            "founder@example.com"
+        );
+
+        // Targeting the workspace by name keeps the current selection.
+        account::use_target(&fixture.paths, "work").unwrap();
+        let state = state::load(&fixture.paths).unwrap();
+        assert_eq!(
+            state.workspaces["work"].selected.as_deref(),
+            Some("founder")
+        );
+        let (resolved, _) = state.resolve_target("work").unwrap();
+        assert_eq!(resolved, "founder");
+    }
+
+    #[test]
+    fn removing_the_selected_member_selects_the_remaining_one() {
+        let fixture = keychain_fixture();
+        fs::write(fixture.control.join("next-email"), "second@example.com").unwrap();
+        join(&fixture.paths, "work", "second", None, false, false).unwrap();
+        account::use_target(&fixture.paths, "second").unwrap();
+
+        // `second` is selected; removing it must hand the selection to the
+        // remaining member and restore that member's identity.
+        account::remove(&fixture.paths, "second", false, false, false).unwrap();
+
+        let state = state::load(&fixture.paths).unwrap();
+        assert_eq!(
+            state.workspaces["work"].selected.as_deref(),
+            Some("founder")
+        );
         assert_eq!(
             shared_claude_json(&fixture)["oauthAccount"]["emailAddress"],
             "founder@example.com"

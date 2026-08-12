@@ -19,16 +19,35 @@ const AUTH_ENVIRONMENT: [&str; 3] = [
     "CLAUDE_CODE_OAUTH_TOKEN",
 ];
 
+/// The environment variable that pins a launch to a target (profile or
+/// workspace), overriding the directory mapping and the default target. The
+/// wrapper re-exports it to the child holding the *resolved* profile name, so
+/// nested `claude` invocations inside a session stay on the same login even
+/// when a workspace's selection rotates mid-session.
+pub const TARGET_ENVIRONMENT_VARIABLE: &str = "CLAUDE_ACCOUNT_PROFILE";
+
 pub fn exec_active_profile(paths: &AppPaths, arguments: &[OsString]) -> Result<()> {
     let state = state::load(paths)?;
-    let active = state
-        .active
-        .as_deref()
-        .context("no active profile; run `claude account add NAME` or `claude account use NAME`")?;
-    let profile = state
-        .profiles
-        .get(active)
-        .with_context(|| format!("active profile `{active}` does not exist"))?;
+    let target = match env::var_os(TARGET_ENVIRONMENT_VARIABLE) {
+        Some(value) => value
+            .into_string()
+            .ok()
+            .with_context(|| format!("{TARGET_ENVIRONMENT_VARIABLE} is not valid UTF-8"))?,
+        None => state.active.clone().context(
+            "no active profile; run `claude account add NAME` or `claude account use NAME`",
+        )?,
+    };
+    exec_target(paths, &state, &target, arguments)
+}
+
+pub fn exec_target(
+    paths: &AppPaths,
+    state: &state::State,
+    target: &str,
+    arguments: &[OsString],
+) -> Result<()> {
+    let _ = paths;
+    let (profile_name, profile) = state.resolve_target(target)?;
     let real_claude = state
         .real_claude
         .as_deref()
@@ -36,6 +55,7 @@ pub fn exec_active_profile(paths: &AppPaths, arguments: &[OsString]) -> Result<(
     validate_executable(real_claude)?;
 
     let mut command = managed_command(real_claude, &profile.config_dir);
+    command.env(TARGET_ENVIRONMENT_VARIABLE, &profile_name);
     command.args(arguments);
     let error = command.exec();
     Err(error).with_context(|| format!("failed to execute {}", real_claude.display()))

@@ -44,6 +44,30 @@ impl State {
                 .values()
                 .any(|profile| profile.workspace.is_some() || profile.identity.is_some())
     }
+
+    /// Resolve a launch target to the profile Claude should run as. A
+    /// workspace name resolves through the workspace's selected member;
+    /// anything else must be a profile name. Profile and workspace names
+    /// never collide (creation refuses duplicates across both namespaces).
+    pub fn resolve_target(&self, target: &str) -> Result<(String, &Profile)> {
+        if let Some(workspace) = self.workspaces.get(target) {
+            let member = workspace.selected.as_deref().with_context(|| {
+                format!(
+                    "workspace `{target}` has no selected member; pick one with \
+                     `claude account use MEMBER`"
+                )
+            })?;
+            let profile = self.profiles.get(member).with_context(|| {
+                format!("workspace `{target}` selects `{member}`, which no longer exists")
+            })?;
+            return Ok((member.to_owned(), profile));
+        }
+        let profile = self
+            .profiles
+            .get(target)
+            .with_context(|| format!("`{target}` is not a registered profile or workspace"))?;
+        Ok((target.to_owned(), profile))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +78,10 @@ pub struct Workspace {
     /// `--from-profile`); it is never deleted by workspace removal.
     #[serde(default)]
     pub external: bool,
+    /// The member profile that launches targeting this workspace resolve to;
+    /// `claude account use MEMBER` and `claude account watch` change it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected: Option<String>,
 }
 
 impl Workspace {
@@ -62,6 +90,7 @@ impl Workspace {
             dir,
             created_at: unix_now(),
             external,
+            selected: None,
         }
     }
 }
