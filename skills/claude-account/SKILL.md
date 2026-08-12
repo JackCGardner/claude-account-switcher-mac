@@ -1,53 +1,63 @@
 ---
 name: claude-account
-description: Drive the claude-account CLI, the Claude Code profile switcher for macOS/Linux. Use when the user wants to switch Claude Code accounts or subscriptions, add/adopt/list/remove profiles, set up or manage a shared workspace (one directory, several subscription logins), import existing CLAUDE_CONFIG_DIR folders, or troubleshoot the claude shim.
+description: Drive the claude-account CLI, the Claude Code profile switcher for macOS/Linux. Use when the user wants to switch Claude Code accounts or subscriptions, add/adopt/list/remove profiles, set up or manage a shared workspace (one directory, several subscription logins), run parallel sessions on different accounts, map directories to accounts, check usage windows or the dashboard, set up automatic subscription rotation (watch), import existing CLAUDE_CONFIG_DIR folders, or troubleshoot the claude shim.
 ---
 
 # claude-account — Claude Code profile switcher
 
 `claude-account` installs a transparent `claude` shim. `claude account …`
 manages profiles; every other `claude` invocation is forwarded to the real
-Claude Code with `CLAUDE_CONFIG_DIR` pointed at the **active profile's**
+Claude Code with `CLAUDE_CONFIG_DIR` pointed at the resolved profile's
 directory (auth env vars like `ANTHROPIC_API_KEY` are stripped so the
-profile's stored login always wins). It never reads, writes, or copies
-credentials — Claude Code itself performs login/logout/refresh, and recent
-builds key their credential storage (macOS keychain item) off the literal
+profile's stored login always wins). It never writes or copies credentials —
+Claude Code performs login/logout/refresh itself, and recent builds key
+credential storage (the macOS keychain item) off the literal
 `CLAUDE_CONFIG_DIR` string, so each directory is an isolated login.
 
 ## Mental model
 
 - **Profile** — a name → one configuration directory → one login. Sessions,
-  transcripts, auto-memory, settings, and history all live in that directory.
+  transcripts, auto-memory, settings, and history live in that directory.
 - **Adopted profile** — a pre-existing directory registered in place (never
-  copied, never logged out or deleted by this tool).
-- **Workspace** — one shared directory used by several **member profiles**.
-  Everything is common except the login: each member is a private symlink to
-  the directory, and because credentials are keyed by the literal path, each
-  member holds its own subscription login. Switching members = switching
-  which subscription pays, with identical sessions/memories. macOS only (on
-  Linux credentials live inside the shared directory, so `join` refuses).
+  copied; never logged out or deleted by this tool).
+- **Workspace** — one shared directory used by several **member profiles**:
+  everything is common except the login. Each member is a private symlink to
+  the directory; credentials key off the literal path, so each member holds
+  its own subscription. Each workspace has a **selected member** — what
+  launches resolve to and what `watch` rotates. macOS only (on Linux
+  credentials live inside the shared directory, so `join` refuses).
+- **Default target** — what bare `claude` runs: a standalone profile, or a
+  workspace (which resolves through its selected member). There is no global
+  "active profile". Resolution order: `CLAUDE_ACCOUNT_PROFILE` env var →
+  directory binding (`map`) → default target (`use`).
 - Special case: a profile for `~/.claude` runs Claude with
-  `CLAUDE_CONFIG_DIR` unset (an explicit `~/.claude` would select different
-  credentials than plain `claude`). `~/.claude` can never back a workspace.
+  `CLAUDE_CONFIG_DIR` unset, and `~/.claude` can never back a workspace.
 
 ## Commands
 
 ```bash
-# one-time setup (from a release download or repo build)
 ./claude-account install [--real /abs/path/to/claude]   # then add printed PATH line
 
 claude account add NAME [--email E] [--sso] [--console] # new dir + official login
 claude account adopt NAME DIR                           # register existing dir in place
-claude account use NAME                                 # affects new claude processes only
-claude account list [--status]                          # * = active; --status shows email/plan
-claude account current                                  # active profile name (script-safe)
+claude account use NAME              # member: select it in its workspace; workspace or
+                                     # standalone profile: make it the default target
+claude account run NAME [-- ARGS]    # one launch as NAME, nothing switched
+claude account map DIR TARGET        # bare `claude` under DIR targets TARGET
+claude account map                   # list bindings   (unmap DIR removes one)
+claude account list [--status]       # * = what bare `claude` resolves to now
+claude account current               # resolved profile name (script-safe)
+claude account usage [--live]        # 5h / 7d / per-model weekly windows per login
+claude account dashboard [--live] [--once] [--interval N]
+claude account watch WS [--threshold 90] [--strategy consume-first|best|next-available]
+                        [--models all|none|fable,opus] [--live|--cached]
+                        [--interval 60] [--once]        # settings persist per workspace
 claude account remove NAME [--keep-login] [--force] [--purge --yes]
 
-claude account workspace create WS --from-profile PROFILE  # profile's dir becomes shared storage
-claude account workspace create WS                         # or fresh empty storage
-claude account workspace join WS MEMBER [--email E]        # add 2nd subscription (browser login)
-claude account workspace list                              # workspaces, members, emails
-claude account workspace remove WS [--purge --yes]         # members must be removed first
+claude account workspace create WS --from-profile PROFILE  # dir becomes shared storage
+claude account workspace join WS MEMBER [--email E]        # add another subscription
+claude account workspace list
+claude account workspace remove WS [--purge --yes]
 ```
 
 ## Common flows
@@ -57,40 +67,46 @@ claude account workspace remove WS [--purge --yes]         # members must be rem
 ```bash
 claude account adopt personal ~/.claude
 claude account adopt work ~/.claude-work-4
-claude account list --status     # verify each profile's email and plan
+claude account list --status
 ```
 
-**Two subscriptions, one shared work environment** (the workspace flow)
+**Two subscriptions, one shared work environment, auto-rotated**
 
 ```bash
-claude account adopt work-a ~/.claude-work-4              # dir with latest sessions
+claude account adopt work-a ~/.claude-work-4              # dir with the sessions
 claude account workspace create work --from-profile work-a
 claude account workspace join work work-b                 # sign in the OTHER subscription
-# daily use — hit a usage cap? switch and continue in the same sessions:
-claude account use work-b
+claude account watch work                                 # rotate before hitting limits
 ```
 
-**Check what's what**: `claude account list --status` launches Claude once
-per profile, so it takes a few seconds; `claude account workspace list` is
-instant (uses recorded identities).
+When `watch` rotates, running sessions keep working on their old login; to
+move one over, relaunch it with `claude --resume` / `claude -c` — same
+transcript, fresh subscription, because the workspace shares everything.
+
+**Parallel personal + work sessions (no switching)**
+
+```bash
+claude account map ~/Development/movo work   # work terminals need no commands
+claude account map ~/Personal personal
+claude account run personal                  # or explicitly, from anywhere
+```
 
 ## Rules for the assistant
 
-- Logins are interactive browser flows: run `add`/`join` in a way the user
-  can complete, and tell them which account to sign in with. Never try to
-  script or copy credentials, keychain items, or tokens.
+- Logins are interactive browser flows: run `add`/`join` so the user can
+  complete them, and say which account to sign in with. Never script or copy
+  credentials, keychain items, or tokens.
+- `--live` on usage/watch/dashboard is the single sanctioned credential READ
+  (in-memory, to query the usage API); default is cached and reads nothing.
 - Never edit `~/.config/claude-account/state.json`, member symlinks under
   `…/claude-account/profiles/`, or a profile's `.claude.json` by hand; use
-  the CLI. Moving/renaming a member symlink orphans that member's login.
-- `use` only affects newly launched Claude processes; running sessions keep
-  the account they started with.
-- Removing an adopted profile or workspace member never deletes shared data:
-  `remove` on a member logs out only that member and deletes its link
-  (`--keep-login` keeps both so a later `join` with the same name reuses the
-  login without a browser flow).
-- `--purge` is only for directories claude-account created itself; it is
-  refused for adopted dirs and workspace members by design — don't work
-  around that with `rm`.
+  the CLI. Moving or renaming a member symlink orphans that member's login.
+- `use`/`watch` rotations affect newly launched Claude processes; running
+  sessions keep the login they started with (`CLAUDE_ACCOUNT_PROFILE` is
+  pinned into them for nested calls).
+- Removing an adopted profile or workspace member never deletes shared data;
+  `--purge` is only for directories claude-account created itself and is
+  refused elsewhere by design — don't work around that with `rm`.
 
 ## Troubleshooting
 
@@ -100,12 +116,13 @@ instant (uses recorded identities).
 - **"Claude Code resolves the member link before choosing credential
   storage"** — this platform/build cannot give workspace members separate
   logins (always true on Linux). Use plain isolated profiles instead.
+- **"workspace `X` has no selected member"** — pick one:
+  `claude account use MEMBER`.
+- **`usage` shows "no usage data" for an idle member** — run one session as
+  that member, run `watch`, or use `--live` once; observations are then
+  remembered and decay correctly.
 - **"unsupported state version 2"** from an older claude-account binary —
-  workspaces are in use; upgrade the binary (`cargo build --locked --release
-  && ./target/release/claude-account install`).
-- **`claude account` says no active profile / not configured** — run
-  `claude account use NAME`, or `claude-account install` if the real Claude
-  path was never recorded.
+  upgrade the binary (`cargo build --locked --release && ./target/release/claude-account install`).
 - **Shim not first on PATH** (`type -a claude` shows the official binary
   first) — re-add the PATH line `install` printed, open a new terminal.
 - **Wrong email shown inside Claude after switching members** — run

@@ -37,15 +37,53 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   fields; without workspaces it stays at version 1.
 - A Claude Code skill (`skills/claude-account/SKILL.md`) that teaches Claude
   how to drive this CLI.
+- `account run NAME [ARGS...]` launches Claude once as a profile or workspace
+  without changing the default target, and the `CLAUDE_ACCOUNT_PROFILE`
+  environment variable pins any launch the same way (re-exported holding the
+  resolved profile so nested invocations stay on their session's login).
+- `account map DIRECTORY TARGET` binds a directory tree to a profile or
+  workspace: bare `claude` inside it targets that automatically (deepest
+  binding wins); `map` lists bindings, `unmap` removes one, and removals
+  clean up bindings that pointed at the removed name.
+- `account usage [--live]` shows each login's 5-hour, 7-day, and per-model
+  weekly windows with reset countdowns, grouped by workspace. Data is
+  cache-first from Claude's own `cachedUsageUtilization` snapshots (account-
+  UUID-tagged, with passed resets decayed to zero); `--live` opts into
+  querying Anthropic's usage API with each login's keychain token —
+  read-only, and the only credential read in the tool.
+- `account watch WORKSPACE` rotates the workspace's selected member before a
+  usage window hits its limit: gating windows are OR'd (5h, 7d, per-model
+  weeklies via `--models`, default `all`), `--threshold` defaults to 90%, and
+  `--strategy` picks the replacement (`consume-first` by default — the member
+  whose weekly window resets soonest — or `best` / `next-available`), with
+  hysteresis, a rotation cooldown that a hard 100% limit overrides, adaptive
+  polling, persisted per-workspace settings, `--once`, and a desktop
+  notification on rotation. Decision logic ported from claude-swap (MIT).
+  The watcher records each member's freshest observed windows so idle
+  members keep known, decaying numbers in cached mode.
+- `account dashboard` renders a full-screen auto-refreshing comparison of
+  every login — workspaces grouped with members and watch status, standalone
+  profiles separate, usage bars per window — with no TUI dependency.
 
 ### Changed
 
+- The single global active profile is gone: each workspace tracks its own
+  **selected member** (what `use MEMBER` and `watch` rotate), and the
+  `active` name is now a default launch target that can be a workspace —
+  resolving through its selection — or a standalone profile. Profile and
+  workspace names share one namespace, `current` prints the resolved
+  profile, and `list` marks the resolved default.
 - `account remove` on a workspace member logs out only that member's login,
   deletes its member link, and never touches the shared directory.
   `--keep-login` keeps the link so a later `workspace join` with the same
   name reuses the login without a new browser flow. Purging is refused for
   workspace members, and `workspace remove --purge` only ever deletes
-  directories that claude-account created itself.
+  directories that claude-account created itself. Removing the selected
+  member hands the selection to the only remaining member.
+- Writes to a profile's `.claude.json` (onboarding, identity swaps) now take
+  Claude Code's own `.claude.json.lock` mkdir-mutex, so they cannot interleave
+  with a running session's config writes; stale locks are taken over and a
+  live holder only delays the (still atomic) write briefly.
 
 ## [0.2.0] - 2026-07-31
 

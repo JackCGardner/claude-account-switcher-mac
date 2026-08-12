@@ -15,6 +15,11 @@ claude account adopt movo ~/.claude-work
 claude account workspace create work --from-profile movo
 claude account workspace join work movo-2
 claude account use work
+claude account run personal          # parallel session, no switching
+claude account map ~/Dev/movo work   # bare `claude` in there uses work
+claude account usage
+claude account watch work            # auto-rotate before hitting limits
+claude account dashboard
 claude account list
 claude account current
 claude account remove personal
@@ -24,7 +29,10 @@ claude "fix this bug in main.py"
 ```
 
 Claude Code itself performs login, logout, credential storage, and token
-refresh. `claude-account` never reads or copies credential contents.
+refresh. `claude-account` never writes, copies, or moves credential contents;
+by default it never reads them either. The only exception is the opt-in
+`--live` flag on `usage`/`watch`/`dashboard`, which reads each login's token
+from the keychain — in memory, read-only — to query Anthropic's usage API.
 
 > [!IMPORTANT]
 > This is an independent community project, forked from
@@ -189,11 +197,74 @@ founding profile back into a standalone one.
 ### Switch accounts
 
 ```bash
-claude account use work
+claude account use movo-2     # a workspace member: select it, target its workspace
+claude account use work       # a workspace: target it (keeps its selection)
+claude account use personal   # a standalone profile
 ```
 
-Switching affects newly launched Claude processes. Existing sessions keep the
-account with which they were started.
+There is no single global "active profile"; there is a **default target** for
+bare `claude`, and each workspace tracks its own **selected member**. Using a
+member selects it inside its workspace and makes the workspace the default
+target, so later rotations (manual or from `watch`) apply without another
+`use`. Switching affects newly launched Claude processes; existing sessions
+keep the account they started with. `current` prints the profile a bare
+`claude` would resolve to right now.
+
+### Run a profile once, without switching anything
+
+```bash
+claude account run personal
+claude account run work -- --model opus "review this diff"
+```
+
+`run` launches Claude as the named profile or workspace (through its selected
+member) in this terminal only — ideal for a personal session alongside your
+work workspace. The `CLAUDE_ACCOUNT_PROFILE` environment variable does the
+same for any launch, and the wrapper re-exports it holding the resolved
+profile so nested `claude` invocations stay on the login their session
+started with.
+
+### Bind directories to targets
+
+```bash
+claude account map ~/Development/movo work
+claude account map ~/Personal personal
+claude account map        # list bindings
+claude account unmap ~/Personal
+```
+
+Bare `claude` inside a bound directory (or any subdirectory — the deepest
+binding wins) targets the bound profile or workspace automatically.
+Precedence: `CLAUDE_ACCOUNT_PROFILE`, then bindings, then the default target.
+
+### Usage, the dashboard, and automatic rotation
+
+```bash
+claude account usage             # per-login 5h / 7d / per-model weekly windows
+claude account dashboard         # full-screen, auto-refreshing comparison
+claude account watch work        # rotate the workspace before hitting a limit
+claude account watch work --threshold 85 --models fable --strategy best --once
+```
+
+Usage data is cache-first: Claude Code stores its last usage snapshot inside
+the profile's `.claude.json`, tagged with the account it belongs to; sessions
+refresh it while they run, an idle login's windows only decay, and the
+watcher remembers each member's freshest numbers. `--live` (opt-in, macOS)
+instead queries Anthropic's usage API with each login's keychain token —
+read-only, and the only place this tool ever reads a credential.
+
+`watch` checks the workspace's gating windows — the 5-hour and 7-day windows
+always, plus per-model weekly windows per `--models` (default `all`) — and
+when any reaches `--threshold` (default 90%) it rotates the workspace's
+selected member and sends a desktop notification. `--strategy` picks the
+replacement: `consume-first` (default — soonest weekly reset, so no quota is
+wasted), `best` (most headroom), or `next-available`. Anti-flap hysteresis
+requires candidates to sit 10 points below the threshold, and rotations are
+at least 10 minutes apart unless the selected member is hard-limited.
+Settings persist per workspace, so a bare `claude account watch work` reuses
+them. Running sessions are never touched: the rotated-away session keeps
+working until you relaunch it — `claude --resume` / `claude -c` continues the
+same transcript on the fresh subscription.
 
 ### Inspect profiles
 
@@ -302,12 +373,18 @@ under `profiles/<name>` as symlinks to their workspace directory; the member's
 login is keyed to the symlink's own path, so moving or renaming the link
 orphans that login.
 
-The state file contains profile names, directory paths, the real Claude
-executable path, and — for workspace members — the account-identity metadata
-Claude Code shows for the login (email and account ids). It never contains
-access or refresh tokens.
+The state file contains profile names, directory paths, directory bindings,
+the real Claude executable path, per-workspace watch settings, and — for
+workspace members — the account-identity metadata Claude Code shows for the
+login (email and account ids) plus the last usage percentages the watcher
+observed. It never contains access or refresh tokens.
 
 ## Authentication environment variables
+
+`CLAUDE_ACCOUNT_PROFILE` pins a launch to a profile or workspace name,
+overriding directory bindings and the default target; the wrapper re-exports
+it to the child holding the resolved profile name so nested `claude`
+invocations stay on their session's login.
 
 To guarantee that the selected profile is actually used, the wrapper removes
 these variables from the child Claude process:
