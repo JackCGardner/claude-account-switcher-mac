@@ -45,8 +45,8 @@ claude account use NAME              # member: select it in its workspace; works
 claude account run NAME [-- ARGS]    # one launch as NAME, nothing switched
 claude account map DIR TARGET        # bare `claude` under DIR targets TARGET
 claude account map                   # list bindings   (unmap DIR removes one)
-claude account list [--status]       # * = what bare `claude` resolves to now
-claude account current               # resolved profile name (script-safe)
+claude account list [--status]       # * = the default target's resolved profile
+claude account current               # profile a bare `claude` here resolves to (script-safe)
 claude account usage [--live]        # 5h / 7d / per-model weekly windows per login
 claude account dashboard [--live] [--once] [--interval N]
 claude account watch WS [--threshold 90] [--strategy consume-first|best|next-available]
@@ -54,7 +54,8 @@ claude account watch WS [--threshold 90] [--strategy consume-first|best|next-ava
                         [--interval 60] [--once]        # settings persist per workspace
 claude account remove NAME [--keep-login] [--force] [--purge --yes]
 
-claude account workspace create WS --from-profile PROFILE  # dir becomes shared storage
+claude account workspace create WS [--from-profile PROFILE]  # dir becomes shared storage
+                                     # (omit --from-profile for a fresh empty workspace)
 claude account workspace join WS MEMBER [--email E]        # add another subscription
 claude account workspace list
 claude account workspace remove WS [--purge --yes]

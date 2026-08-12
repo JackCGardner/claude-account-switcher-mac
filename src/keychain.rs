@@ -64,6 +64,13 @@ pub fn read_access_token(config_dir: &Path, home: Option<&Path>) -> Result<Strin
         bail!("no keychain login found under service `{service}`");
     }
     let raw = String::from_utf8(output.stdout).context("keychain item is not valid UTF-8")?;
+    extract_access_token(&raw)
+}
+
+/// Pull the access token out of Claude's credential JSON and refuse tokens
+/// containing characters that could escape the quoted curl-config value they
+/// are later embedded in (defense in depth against a tampered keychain item).
+fn extract_access_token(raw: &str) -> Result<String> {
     let value: serde_json::Value = serde_json::from_str(raw.trim())
         .context("keychain item does not contain Claude's credential JSON")?;
     let token = value
@@ -71,6 +78,13 @@ pub fn read_access_token(config_dir: &Path, home: Option<&Path>) -> Result<Strin
         .and_then(|oauth| oauth.get("accessToken"))
         .and_then(|token| token.as_str())
         .context("keychain item has no OAuth access token")?;
+    if token.is_empty()
+        || token
+            .chars()
+            .any(|character| character == '"' || character == '\\' || character.is_control())
+    {
+        bail!("keychain access token has an unexpected format");
+    }
     Ok(token.to_owned())
 }
 
@@ -94,6 +108,27 @@ mod tests {
         let nfc = "/tmp/caf\u{00e9}";
         assert_eq!(service_name(Some(nfd)), service_name(Some(nfc)));
         assert_eq!(service_name(Some(nfd)), "Claude Code-credentials-0873cca0");
+    }
+
+    #[test]
+    fn tokens_with_config_breaking_characters_are_refused() {
+        let good = r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-abc_DEF.123~xyz"}}"#;
+        assert_eq!(
+            extract_access_token(good).unwrap(),
+            "sk-ant-oat01-abc_DEF.123~xyz"
+        );
+        for bad in [
+            r#"{"claudeAiOauth":{"accessToken":"a\"b"}}"#,
+            r#"{"claudeAiOauth":{"accessToken":"a\\b"}}"#,
+            r#"{"claudeAiOauth":{"accessToken":"a\nproxy = \"http://evil/\""}}"#,
+            r#"{"claudeAiOauth":{"accessToken":""}}"#,
+        ] {
+            let error = extract_access_token(bad).unwrap_err();
+            assert!(
+                error.to_string().contains("unexpected format"),
+                "{bad}: {error:#}"
+            );
+        }
     }
 
     #[test]

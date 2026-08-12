@@ -16,7 +16,7 @@ use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
@@ -217,44 +217,85 @@ pub fn windows_from_live(data: &Value) -> Vec<Window> {
     windows
 }
 
+const CURL_CONFIG_PREFIX: &str = ".usage-curl.";
+
+/// Best-effort cleanup of token-bearing curl config files left behind by an
+/// earlier run that was killed mid-fetch (SIGKILL, power loss). Files younger
+/// than a minute may belong to a live concurrent fetch and are left alone.
+fn sweep_stale_curl_configs(data_dir: &Path) {
+    let Ok(entries) = fs::read_dir(data_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(CURL_CONFIG_PREFIX) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .map(|modified| {
+                SystemTime::now()
+                    .duration_since(modified)
+                    .unwrap_or_default()
+                    > Duration::from_secs(60)
+            })
+            .unwrap_or(true);
+        if stale {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Removes the token-bearing config file on every exit path, including
+/// panics. (A SIGKILL still skips this; the sweep above covers that case on
+/// the next fetch.)
+struct TempFileGuard(PathBuf);
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
 /// Fetch the login's usage windows from the usage API. The token rides in a
 /// 0600 curl config file (never in argv) that is deleted immediately after.
 pub fn fetch_live(paths: &AppPaths, profile: &Profile, home: Option<&Path>) -> Result<Vec<Window>> {
     let token = keychain::read_access_token(&profile.config_dir, home)?;
     state::ensure_private_dir(&paths.data_dir)?;
+    sweep_stale_curl_configs(&paths.data_dir);
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let config_path = paths
-        .data_dir
-        .join(format!(".usage-curl.{}.{}", std::process::id(), nonce));
+    let config_path = paths.data_dir.join(format!(
+        "{CURL_CONFIG_PREFIX}{}.{}",
+        std::process::id(),
+        nonce
+    ));
+    let _cleanup = TempFileGuard(config_path.clone());
     let config = format!(
         "url = \"{USAGE_URL}\"\nheader = \"Authorization: Bearer {token}\"\nheader = \
          \"anthropic-beta: {OAUTH_BETA_HEADER}\"\nheader = \"User-Agent: claude-account/{}\"\n",
         env!("CARGO_PKG_VERSION")
     );
-    let write_result = (|| -> Result<()> {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(&config_path)
-            .with_context(|| format!("failed to create {}", config_path.display()))?;
-        file.write_all(config.as_bytes())
-            .context("failed to write the request configuration")?;
-        Ok(())
-    })();
-    if let Err(error) = write_result {
-        let _ = fs::remove_file(&config_path);
-        return Err(error);
-    }
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&config_path)
+        .with_context(|| format!("failed to create {}", config_path.display()))?;
+    file.write_all(config.as_bytes())
+        .context("failed to write the request configuration")?;
+    drop(file);
 
     let output = Command::new("curl")
         .args(["-sf", "--max-time", "8", "--config"])
         .arg(&config_path)
         .output();
-    let _ = fs::remove_file(&config_path);
     let output = output.context("failed to run curl")?;
     if !output.status.success() {
         bail!(
@@ -626,7 +667,7 @@ pub fn parse_rfc3339(input: &str) -> Option<i64> {
     {
         return None;
     }
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    if !(1..=12).contains(&month) || !(1..=days_in_month(year, month)).contains(&day) {
         return None;
     }
 
@@ -661,6 +702,21 @@ pub fn parse_rfc3339(input: &str) -> Option<i64> {
     )
 }
 
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
 /// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's
 /// `days_from_civil` algorithm).
 fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
@@ -689,6 +745,14 @@ mod tests {
         );
         assert_eq!(parse_rfc3339("not a date"), None);
         assert_eq!(parse_rfc3339("2026-13-01T00:00:00Z"), None);
+        // Calendar-invalid days are rejected instead of rolling forward.
+        assert_eq!(parse_rfc3339("2023-02-30T00:00:00Z"), None);
+        assert_eq!(parse_rfc3339("2023-04-31T00:00:00Z"), None);
+        assert_eq!(
+            parse_rfc3339("2024-02-29T00:00:00Z"),
+            Some(1_709_164_800),
+            "leap day must stay valid"
+        );
     }
 
     #[test]

@@ -85,6 +85,34 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   with a running session's config writes; stale locks are taken over and a
   live holder only delays the (still atomic) write briefly.
 
+### Fixed
+
+Findings from a four-way adversarial validation pass (code review, sandboxed
+functional testing, security review, docs audit):
+
+- `add` and `workspace join` re-check the shared profile/workspace namespace
+  after the interactive login, so a workspace created during the login window
+  can no longer silently shadow the just-logged-in profile.
+- The watch candidate ceiling is clamped (`max(threshold − 10, threshold/2)`),
+  so thresholds below the hysteresis margin can still rotate to a genuinely
+  idle member instead of reporting all members saturated forever.
+- `remove`'s post-logout identity restore now runs under the state lock, so a
+  concurrent `use`/watch rotation can no longer be overwritten with a stale
+  identity.
+- Removing the last member of the default-target workspace requires
+  `--force` (mirroring the standalone active-profile gate) and leaving a
+  workspace memberless prints how to re-join or remove it.
+- `current` resolves exactly like a bare `claude` launch — environment
+  override and directory bindings included — instead of only the default
+  target.
+- The RFC 3339 parser rejects calendar-invalid dates (Feb 30, Apr 31) instead
+  of rolling them forward; `--interval` is bounded to 15–86400 seconds.
+- Hardening: tokens containing curl-config-breaking characters are refused;
+  stale token-bearing curl config files from killed fetches are swept and a
+  drop guard removes them on panic; the state lock refuses symlinks
+  (O_NOFOLLOW); managed directories are created with 0700 atomically at mkdir
+  time; the `.claude.json.lock` path is built without lossy UTF-8 conversion.
+
 ## [0.2.0] - 2026-07-31
 
 ### Added

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -13,6 +13,13 @@ use serde_json::Value;
 use crate::paths::AppPaths;
 
 const LOCK_EX: i32 = 2;
+
+/// Refuse to follow a symlink planted at the fixed lock path (defense in
+/// depth; the config dir is 0700).
+#[cfg(target_os = "macos")]
+const O_NOFOLLOW: i32 = 0x0100;
+#[cfg(not(target_os = "macos"))]
+const O_NOFOLLOW: i32 = 0o400000;
 
 unsafe extern "C" {
     fn flock(fd: i32, operation: i32) -> i32;
@@ -227,6 +234,7 @@ impl StateLock {
             .write(true)
             .truncate(false)
             .mode(0o600)
+            .custom_flags(O_NOFOLLOW)
             .open(&paths.lock_file)
             .with_context(|| format!("failed to open {}", paths.lock_file.display()))?;
 
@@ -310,7 +318,12 @@ pub fn save(paths: &AppPaths, state: &State) -> Result<()> {
 }
 
 pub fn ensure_private_dir(path: &Path) -> Result<()> {
-    fs::create_dir_all(path)
+    // The mode is applied at mkdir time (no create-then-chmod window); the
+    // set_permissions afterwards covers pre-existing directories.
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
         .with_context(|| format!("failed to create directory {}", path.display()))?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
         .with_context(|| format!("failed to protect directory {}", path.display()))?;

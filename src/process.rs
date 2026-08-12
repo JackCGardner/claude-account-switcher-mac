@@ -26,24 +26,43 @@ const AUTH_ENVIRONMENT: [&str; 3] = [
 /// when a workspace's selection rotates mid-session.
 pub const TARGET_ENVIRONMENT_VARIABLE: &str = "CLAUDE_ACCOUNT_PROFILE";
 
+/// The target a launch resolves to, in precedence order: explicit environment
+/// override, then the deepest directory binding covering `cwd`, then the
+/// default target.
+pub fn launch_target(
+    state: &state::State,
+    env_override: Option<String>,
+    cwd: Option<&Path>,
+) -> Result<String> {
+    if let Some(value) = env_override {
+        return Ok(value);
+    }
+    if let Some(mapped) = cwd.and_then(|cwd| state.mapped_target(cwd)) {
+        return Ok(mapped.to_owned());
+    }
+    state
+        .active
+        .clone()
+        .context("no active profile; run `claude account add NAME` or `claude account use NAME`")
+}
+
+/// `launch_target` fed from this process's real environment.
+pub fn current_launch_target(state: &state::State) -> Result<String> {
+    let env_override = match env::var_os(TARGET_ENVIRONMENT_VARIABLE) {
+        Some(value) => Some(
+            value
+                .into_string()
+                .ok()
+                .with_context(|| format!("{TARGET_ENVIRONMENT_VARIABLE} is not valid UTF-8"))?,
+        ),
+        None => None,
+    };
+    launch_target(state, env_override, env::current_dir().ok().as_deref())
+}
+
 pub fn exec_active_profile(paths: &AppPaths, arguments: &[OsString]) -> Result<()> {
     let state = state::load(paths)?;
-    let target = if let Some(value) = env::var_os(TARGET_ENVIRONMENT_VARIABLE) {
-        value
-            .into_string()
-            .ok()
-            .with_context(|| format!("{TARGET_ENVIRONMENT_VARIABLE} is not valid UTF-8"))?
-    } else if let Some(mapped) = env::current_dir()
-        .ok()
-        .as_deref()
-        .and_then(|cwd| state.mapped_target(cwd))
-    {
-        mapped.to_owned()
-    } else {
-        state.active.clone().context(
-            "no active profile; run `claude account add NAME` or `claude account use NAME`",
-        )?
-    };
+    let target = current_launch_target(&state)?;
     exec_target(&state, &target, arguments)
 }
 
@@ -231,6 +250,36 @@ fn validate_distinct_executable(candidate: &Path, current_executable: &Path) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_targets_resolve_env_then_mapping_then_default() {
+        let mut state = state::State {
+            active: Some("fallback".to_owned()),
+            ..state::State::default()
+        };
+        state
+            .mappings
+            .insert(PathBuf::from("/proj"), "mapped".to_owned());
+
+        assert_eq!(
+            launch_target(
+                &state,
+                Some("explicit".to_owned()),
+                Some(Path::new("/proj/sub"))
+            )
+            .unwrap(),
+            "explicit"
+        );
+        assert_eq!(
+            launch_target(&state, None, Some(Path::new("/proj/sub"))).unwrap(),
+            "mapped"
+        );
+        assert_eq!(
+            launch_target(&state, None, Some(Path::new("/elsewhere"))).unwrap(),
+            "fallback"
+        );
+        assert!(launch_target(&state::State::default(), None, None).is_err());
+    }
 
     #[test]
     fn default_config_dir_detection_ignores_trailing_slashes() {

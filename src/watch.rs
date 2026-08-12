@@ -21,6 +21,14 @@ use crate::workspace;
 /// A candidate must sit at least this far below the threshold, so two
 /// accounts hovering at the line cannot flap.
 pub const HYSTERESIS_PCT: f64 = 10.0;
+
+/// The utilization a rotation candidate must not exceed. The subtraction is
+/// clamped so unusually low thresholds (below the hysteresis margin) still
+/// leave room for genuinely idle candidates instead of making rotation
+/// impossible.
+pub fn candidate_ceiling(threshold: f64) -> f64 {
+    (threshold - HYSTERESIS_PCT).max(threshold / 2.0)
+}
 /// Minimum seconds between automatic rotations (ignored once the selected
 /// member is hard-limited at 100%).
 pub const ROTATION_COOLDOWN_SECS: i64 = 600;
@@ -168,11 +176,12 @@ pub fn decide(
         }
     }
 
+    let ceiling = candidate_ceiling(settings_threshold);
     let mut candidates: Vec<(&MemberSnapshot, f64)> = members
         .iter()
         .filter(|member| member.name != selected && member.known)
         .filter_map(|member| max_gate(&member.windows, filter).map(|gate| (member, gate)))
-        .filter(|(_, gate)| *gate <= settings_threshold - HYSTERESIS_PCT)
+        .filter(|(_, gate)| *gate <= ceiling)
         .collect();
     if candidates.is_empty() {
         return Decision::AllSaturated;
@@ -350,7 +359,7 @@ fn tick(paths: &AppPaths, workspace_name: &str, settings: &WatchSettings) -> Res
                 line: format!(
                     "watch {workspace_name}: every member is above {:.0}% — staying on \
                      `{selected}` until a window resets",
-                    settings.threshold - HYSTERESIS_PCT
+                    candidate_ceiling(settings.threshold)
                 ),
                 rotated: false,
                 sleep_secs,
@@ -414,7 +423,10 @@ pub fn command_watch(
             settings.live = false;
         }
         if let Some(interval) = interval {
-            settings.interval_secs = interval.max(15);
+            if !(15..=86_400).contains(&interval) {
+                bail!("--interval must be between 15 and 86400 seconds");
+            }
+            settings.interval_secs = interval;
         }
         workspace.watch = Some(settings.clone());
         state::save(paths, &state)?;
@@ -653,6 +665,44 @@ mod tests {
             1_000,
         );
         assert!(matches!(decision, Decision::Stay { .. }), "{decision:?}");
+    }
+
+    #[test]
+    fn low_thresholds_keep_a_workable_candidate_ceiling() {
+        assert_eq!(candidate_ceiling(90.0), 80.0);
+        assert_eq!(candidate_ceiling(5.0), 2.5);
+
+        // threshold 5 → ceiling 2.5: a truly idle candidate still qualifies…
+        let members = vec![
+            member("a", vec![window("7d", 6.0, None)]),
+            member("b", vec![window("7d", 1.0, None)]),
+        ];
+        let decision = decide(
+            "a",
+            &members,
+            5.0,
+            Strategy::ConsumeFirst,
+            &ModelFilter::All,
+            None,
+            1_000,
+        );
+        assert!(matches!(decision, Decision::Switch { .. }), "{decision:?}");
+
+        // …while one above the clamped ceiling still does not.
+        let members = vec![
+            member("a", vec![window("7d", 6.0, None)]),
+            member("b", vec![window("7d", 4.0, None)]),
+        ];
+        let decision = decide(
+            "a",
+            &members,
+            5.0,
+            Strategy::ConsumeFirst,
+            &ModelFilter::All,
+            None,
+            1_000,
+        );
+        assert_eq!(decision, Decision::AllSaturated);
     }
 
     #[test]

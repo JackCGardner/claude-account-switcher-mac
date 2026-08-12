@@ -85,7 +85,7 @@ impl WorkspaceCommand {
     }
 }
 
-fn create(
+pub(crate) fn create(
     paths: &AppPaths,
     name: &str,
     from_profile: Option<&str>,
@@ -387,6 +387,15 @@ fn join(
         let mut state = state::load(paths)?;
         if state.profiles.contains_key(name) {
             bail!("profile `{name}` was added by another process");
+        }
+        // The login ran with the lock released; re-check the shared namespace
+        // against workspaces created in the meantime too.
+        if state.workspaces.contains_key(name) {
+            bail!(
+                "a workspace named `{name}` was created while logging in; retry with another \
+                 member name, or undo the login with `CLAUDE_CONFIG_DIR='{}' claude auth logout`",
+                member_path.display()
+            );
         }
         if !state.workspaces.contains_key(workspace_name) {
             bail!("workspace `{workspace_name}` was removed by another process");
@@ -1015,6 +1024,24 @@ mod tests {
         let raw: Value =
             serde_json::from_slice(&fs::read(&fixture.paths.state_file).unwrap()).unwrap();
         assert_eq!(raw["version"], 1);
+    }
+
+    #[test]
+    fn removing_the_last_member_of_the_default_workspace_requires_force() {
+        let fixture = keychain_fixture();
+        // `create --from-profile` retargeted launches to the workspace, and
+        // the founder is its only member.
+        let error = account::remove(&fixture.paths, "founder", false, false, false).unwrap_err();
+        assert!(error.to_string().contains("last member"), "{error:#}");
+
+        account::remove(&fixture.paths, "founder", false, true, false).unwrap();
+        let state = state::load(&fixture.paths).unwrap();
+        assert!(!state.profiles.contains_key("founder"));
+        assert!(
+            state.workspaces.contains_key("work"),
+            "the memberless workspace stays registered for later join/remove"
+        );
+        assert!(state.workspaces["work"].selected.is_none());
     }
 
     #[test]

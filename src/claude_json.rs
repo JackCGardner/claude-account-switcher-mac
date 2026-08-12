@@ -29,7 +29,11 @@ struct ConfigLock {
 
 impl ConfigLock {
     fn acquire(config_path: &Path) -> ConfigLock {
-        let path = PathBuf::from(format!("{}.lock", config_path.display()));
+        // Append to the raw OsStr rather than `.display()` (lossy for
+        // non-UTF-8 paths) so the lock always sits exactly next to the file.
+        let mut lock_name = config_path.as_os_str().to_os_string();
+        lock_name.push(".lock");
+        let path = PathBuf::from(lock_name);
         let deadline = Instant::now() + LOCK_WAIT;
         loop {
             match fs::create_dir(&path) {

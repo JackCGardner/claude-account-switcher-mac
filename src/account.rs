@@ -302,6 +302,15 @@ fn add(paths: &AppPaths, name: &str, email: Option<&str>, sso: bool, console: bo
         if state.profiles.contains_key(name) {
             bail!("profile `{name}` was added by another process");
         }
+        // The interactive login ran with the lock released, so the namespace
+        // must be re-checked against workspaces too.
+        if state.workspaces.contains_key(name) {
+            bail!(
+                "a workspace named `{name}` was created while logging in; retry with another \
+                 profile name, or undo the login with `CLAUDE_CONFIG_DIR='{}' claude auth logout`",
+                profile_dir.display()
+            );
+        }
         first_profile = state.profiles.is_empty();
         state.real_claude = Some(real_claude);
         state
@@ -635,8 +644,10 @@ fn profile_status(state: &state::State, profile: &Profile) -> String {
 
 fn current(paths: &AppPaths) -> Result<()> {
     let state = state::load(paths)?;
-    let target = state.active.as_deref().context("no active profile")?;
-    let (profile_name, _) = state.resolve_target(target)?;
+    // Resolve exactly like a bare `claude` launch from this directory would:
+    // env override, then directory bindings, then the default target.
+    let target = process::current_launch_target(&state)?;
+    let (profile_name, _) = state.resolve_target(&target)?;
     println!("{profile_name}");
     Ok(())
 }
@@ -681,6 +692,28 @@ pub(crate) fn remove(
         if is_active && !force {
             bail!(
                 "`{name}` is active; switch profiles first, or pass --force to leave no active profile"
+            );
+        }
+        // Removing the last member of the workspace bare `claude` targets
+        // leaves nothing to resolve — the same situation the standalone
+        // --force gate protects against.
+        let breaks_default_workspace = profile.workspace.as_deref().is_some_and(|workspace_name| {
+            state.active.as_deref() == Some(workspace_name)
+                && state
+                    .profiles
+                    .values()
+                    .filter(|entry| entry.workspace.as_deref() == Some(workspace_name))
+                    .count()
+                    == 1
+        });
+        if breaks_default_workspace && !force {
+            bail!(
+                "`{name}` is the last member of the default-target workspace `{}`; switch \
+                 targets first, or pass --force",
+                profile
+                    .workspace
+                    .as_deref()
+                    .expect("membership checked above")
             );
         }
         (
@@ -769,6 +802,13 @@ pub(crate) fn remove(
                         }
                     }
                 }
+                if remaining.is_empty() {
+                    println!(
+                        "Workspace `{workspace_name}` has no members left; join one with \
+                         `claude account workspace join {workspace_name} PROFILE` or remove it \
+                         with `claude account workspace remove {workspace_name}`."
+                    );
+                }
             }
         }
         state::save(paths, &state)?;
@@ -789,9 +829,14 @@ pub(crate) fn remove(
             }
         }
         // Logging this member out may have cleared the shared identity
-        // fields; restore the selected member's.
-        let state = state::load(paths)?;
-        workspace::write_selected_identity(&state, workspace_name);
+        // fields; restore the selected member's — under the state lock, so a
+        // concurrent `use`/rotation cannot be overwritten with a stale
+        // identity read.
+        {
+            let _lock = StateLock::acquire(paths)?;
+            let state = state::load(paths)?;
+            workspace::write_selected_identity(&state, workspace_name);
+        }
     }
 
     if purge {
@@ -1191,6 +1236,62 @@ mod tests {
             "{error:#}"
         );
         assert!(!state::load(&paths).unwrap().profiles.contains_key("work"));
+    }
+
+    #[test]
+    fn add_recheck_refuses_a_workspace_created_during_login() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_roots(temp.path().join("config"), temp.path().join("data"));
+        let fake_claude = temp.path().join("claude-real");
+        let control = temp.path().join("control");
+        fs::create_dir_all(&control).unwrap();
+        // The login blocks until the test says continue, modeling the window
+        // where `add` has released the state lock for the interactive flow.
+        install_fake_claude(
+            &fake_claude,
+            &format!(
+                "#!/bin/sh\n\
+                 if [ \"$1 $2\" = \"auth login\" ]; then\n\
+                   touch '{ctl}/login-started'\n\
+                   while [ ! -f '{ctl}/login-continue' ]; do sleep 0.02; done\n\
+                   touch \"$CLAUDE_CONFIG_DIR/.fake-credentials\"\n\
+                   exit 0\n\
+                 fi\n\
+                 if [ \"$1 $2 $3\" = \"auth status --json\" ]; then\n\
+                   if [ -f \"$CLAUDE_CONFIG_DIR/.fake-credentials\" ]; then\n\
+                     printf '{{\"loggedIn\":true}}\\n'\n\
+                     exit 0\n\
+                   fi\n\
+                   printf '{{\"loggedIn\":false}}\\n'\n\
+                   exit 1\n\
+                 fi\n\
+                 exit 0\n",
+                ctl = control.display()
+            ),
+        );
+        configure_real_claude(&paths, &fake_claude);
+
+        std::thread::scope(|scope| {
+            let add_thread = scope.spawn(|| add(&paths, "racer", None, false, false));
+            let mut waited = 0;
+            while !control.join("login-started").exists() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                waited += 1;
+                assert!(waited < 1_000, "fake login never started");
+            }
+            // A workspace takes the name while the login is still open.
+            crate::workspace::create(&paths, "racer", None, None).unwrap();
+            fs::write(control.join("login-continue"), b"go").unwrap();
+            let error = add_thread.join().unwrap().unwrap_err();
+            assert!(
+                error.to_string().contains("was created while logging in"),
+                "{error:#}"
+            );
+        });
+
+        let state = state::load(&paths).unwrap();
+        assert!(!state.profiles.contains_key("racer"));
+        assert!(state.workspaces.contains_key("racer"));
     }
 
     #[test]

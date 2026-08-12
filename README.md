@@ -9,7 +9,6 @@ isolated `CLAUDE_CONFIG_DIR` for each account and transparently forwards normal
 commands to the official Claude executable.
 
 ```bash
-claude account add work
 claude account add personal
 claude account adopt movo ~/.claude-work
 claude account workspace create work --from-profile movo
@@ -19,7 +18,7 @@ claude account run personal          # parallel session, no switching
 claude account map ~/Dev/movo work   # bare `claude` in there uses work
 claude account usage
 claude account watch work            # auto-rotate before hitting limits
-claude account dashboard
+claude account dashboard             # Ctrl+C exits the live view
 claude account list
 claude account current
 claude account remove personal
@@ -241,8 +240,8 @@ Precedence: `CLAUDE_ACCOUNT_PROFILE`, then bindings, then the default target.
 
 ```bash
 claude account usage             # per-login 5h / 7d / per-model weekly windows
-claude account dashboard         # full-screen, auto-refreshing comparison
-claude account watch work        # rotate the workspace before hitting a limit
+claude account dashboard         # full-screen, auto-refreshing (Ctrl+C exits)
+claude account watch work        # rotate before hitting a limit (runs until Ctrl+C)
 claude account watch work --threshold 85 --models fable --strategy best --once
 ```
 
