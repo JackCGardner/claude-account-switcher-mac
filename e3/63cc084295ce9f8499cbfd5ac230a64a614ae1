@@ -1,0 +1,44 @@
+src/workspace.rs
+  s_6b8b977fbd0014::t_f8bf0280ab4bb1 869,882
+  s_6b8b977fbd0014::t_373a3538dd05d2 404-410,412,414-417
+  s_6b8b977fbd0014::t_c3520cf086cdea 533-537
+  s_6b8b977fbd0014::t_0fb6e562e65bbd 140-148,153-154,156-158
+  s_6b8b977fbd0014::t_94b815221ecdf9 589-594,597,601-603,608-609,620-625,628,631,639,645-653
+  s_6b8b977fbd0014::t_0ac98f6782fa83 443-448,455
+  s_6b8b977fbd0014::t_27a09e8041984c 270,274
+  s_6b8b977fbd0014::t_794ab4a3f4c601 840-848,855
+  s_6b8b977fbd0014::t_51dbbbfc14e084 878-880,883-886,888-914
+  s_6b8b977fbd0014::t_81b3a005ef0f29 205-207
+  s_6b8b977fbd0014::t_63f1ea6849f72a 100-102
+  s_6b8b977fbd0014::t_5aea40064d37b8 654-655
+  s_6b8b977fbd0014::t_74c7bfa1a21ad1 881
+src/state.rs
+  s_6b8b977fbd0014::t_d81b7c71ac623e 47-70,81-84,93
+src/process.rs
+  s_6b8b977fbd0014::t_3fabe5c493c67f 22-28,31-50
+  s_6b8b977fbd0014::t_a05c197a7e5e63 58
+src/account.rs
+  s_6b8b977fbd0014::t_7cec6d2e8e888c 440-444,446
+  s_6b8b977fbd0014::t_025e7448d32183 100
+  s_6b8b977fbd0014::t_a58edfc6719c9a 369-372,376-405,407-414,416-417,419,425,427-430
+  s_6b8b977fbd0014::t_deed03c0aaed88 125-130
+  s_6b8b977fbd0014::t_eddc2658b83fc1 485-488
+  s_6b8b977fbd0014::t_849c45d7589770 315-317
+  s_6b8b977fbd0014::t_371635f912009f 583-611,615,630,632
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "e363cc084295ce9f8499cbfd5ac230a64a614ae1",
+  "prompts": {},
+  "sessions": {
+    "s_6b8b977fbd0014": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "67f56396-3120-4a28-86db-2e14895ff378",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Jack Gardner <6323352+Mortifera@users.noreply.github.com>"
+    }
+  }
+}
