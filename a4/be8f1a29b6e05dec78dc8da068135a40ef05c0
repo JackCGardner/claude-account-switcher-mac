@@ -1,0 +1,68 @@
+README.md
+  s_6b8b977fbd0014::t_fd30a52e2730fb 243-244
+  s_6b8b977fbd0014::t_cb9928ac646d8b 21
+src/process.rs
+  s_6b8b977fbd0014::t_2e4492d7ee923c 281-283
+  s_6b8b977fbd0014::t_485ebb291d3d7b 254-280
+  s_6b8b977fbd0014::t_44c9a2daee445c 29-62,65
+src/workspace.rs
+  s_6b8b977fbd0014::t_0d5a96e95182de 391-399
+  s_6b8b977fbd0014::t_9067bd5cc62592 1029
+  s_6b8b977fbd0014::t_8782dd1b2e4995 88
+  s_6b8b977fbd0014::t_752b7c998d9fdf 1030-1046
+src/keychain.rs
+  s_6b8b977fbd0014::t_b9044db87b70f0 114-133
+  s_6b8b977fbd0014::t_c7053ea542cb3b 67-73,81-87
+  s_6b8b977fbd0014::t_dfcab0dab97c0e 113
+src/usage.rs
+  s_6b8b977fbd0014::t_297f1bccb44963 19
+  s_6b8b977fbd0014::t_13fd447604b45f 220-263,269,274-279,285-291
+  s_6b8b977fbd0014::t_eacb208a809a93 292-293,718-719,755
+  s_6b8b977fbd0014::t_f961c1f7685f6e 670,705-717,754
+  s_6b8b977fbd0014::t_c853510476fd63 748-753
+skills/claude-account/SKILL.md
+  s_6b8b977fbd0014::t_e8f1950cb5e188 48-49
+  s_6b8b977fbd0014::t_9605d0774f4bc4 57-58
+src/account.rs
+  s_6b8b977fbd0014::t_f299ec4247c40e 810,832-836
+  s_6b8b977fbd0014::t_beb8f17c2dc3cf 305-313
+  s_6b8b977fbd0014::t_f0bd7b6530f8ba 805-808
+  s_6b8b977fbd0014::t_1b764782b86c17 697-715
+  s_6b8b977fbd0014::t_9e53e89908cfe5 716-718,811,838-839,1295-1296
+  s_6b8b977fbd0014::t_81423fd90cde71 647-650
+  s_6b8b977fbd0014::t_c4bd06cb6f3292 809,837,1241-1294
+src/claude_json.rs
+  s_6b8b977fbd0014::t_3064bcceb1ae6b 32-36
+src/state.rs
+  s_6b8b977fbd0014::t_688734474b4d77 17-23
+  s_6b8b977fbd0014::t_112b3bf61e2e73 5
+  s_6b8b977fbd0014::t_78da921b0ce0f9 321-326
+  s_6b8b977fbd0014::t_e7d2cbd72040c4 237
+src/watch.rs
+  s_6b8b977fbd0014::t_20b9ff048b1e1c 426-429
+  s_6b8b977fbd0014::t_d8a25794031a1c 362
+  s_6b8b977fbd0014::t_b9b4e265110770 179,184
+  s_6b8b977fbd0014::t_f129c01253055e 24-31
+  s_6b8b977fbd0014::t_4020c9a68b72a6 670
+  s_6b8b977fbd0014::t_d6238e681479af 671-707
+CHANGELOG.md
+  s_6b8b977fbd0014::t_f64d014407339c 88-115
+.gitignore
+  s_6b8b977fbd0014::t_00ef4b665dba22 5-7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "a4be8f1a29b6e05dec78dc8da068135a40ef05c0",
+  "prompts": {},
+  "sessions": {
+    "s_6b8b977fbd0014": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "67f56396-3120-4a28-86db-2e14895ff378",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Jack Gardner <6323352+Mortifera@users.noreply.github.com>"
+    }
+  }
+}
